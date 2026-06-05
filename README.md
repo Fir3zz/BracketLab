@@ -1,6 +1,8 @@
 # BracketLab
 
-![Layout](screen/layout-home.png)
+<p align="center">
+  <img src="screen/layout-home.png" alt="Layout do BracketLab" width="280">
+</p>
 
 BracketLab is an Android Camera2 app for capturing controlled RAW/DNG exposure and focus brackets. It is designed for tripod-based HDR, stacking, long exposure sets, and repeatable manual capture workflows where stable exposure, focus, white balance, and camera module selection matter more than point-and-shoot automation.
 
