@@ -1,0 +1,27 @@
+# Gradle and Android build output
+.gradle/
+.gradle-user/
+build/
+app/build/
+
+# Local Android SDKs and downloaded toolchains
+Sdk/
+gradle-8.12/
+gradle-*.zip
+
+# Local machine and IDE files
+local.properties
+.idea/
+*.iml
+
+# Generated packages and logs
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
