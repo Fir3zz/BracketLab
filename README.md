@@ -171,20 +171,6 @@ RAW support varies by device and by camera module. Some phones expose RAW only o
 
 If a camera does not expose RAW output sizes or `RAW_SENSOR` capability, it is skipped or rejected for capture.
 
-## Repository Notes
-
-The repository intentionally excludes generated and local machine files such as:
-
-- `build/`
-- `app/build/`
-- `.gradle/`
-- `.idea/`
-- `local.properties`
-- local Android SDK folders
-- downloaded Gradle ZIPs
-
-Use the Gradle Wrapper files in the repository instead of committing a local Gradle installation or Android SDK.
-
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
