@@ -1,5 +1,7 @@
 # BracketLab
 
+!(screen/layout-home.png)
+
 BracketLab is an Android Camera2 app for capturing controlled RAW/DNG exposure and focus brackets. It is designed for tripod-based HDR, stacking, long exposure sets, and repeatable manual capture workflows where stable exposure, focus, white balance, and camera module selection matter more than point-and-shoot automation.
 
 The app captures one RAW frame at a time with explicit Camera2 requests, writes DNG files, and provides helper tools for exposure metering, autofocus locking, live manual focus, preview inspection, focus bracketing, and thermal monitoring.
