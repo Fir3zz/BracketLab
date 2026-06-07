@@ -1,4 +1,4 @@
-package com.sec.hdr.bracketing
+package com.lab.bracketlab
 
 import android.content.Context
 import android.util.AttributeSet

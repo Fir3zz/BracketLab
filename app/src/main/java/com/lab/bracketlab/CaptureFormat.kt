@@ -1,4 +1,4 @@
-package com.sec.hdr.bracketing
+package com.lab.bracketlab
 
 import java.util.Locale
 import kotlin.math.log2

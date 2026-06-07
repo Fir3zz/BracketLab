@@ -1,4 +1,4 @@
-package com.sec.hdr.bracketing
+package com.lab.bracketlab
 
 import android.Manifest
 import android.content.ContentValues

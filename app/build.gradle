@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace 'com.sec.hdr.bracketing'
+    namespace 'com.lab.bracketlab'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.sec.hdr.bracketing"
+        applicationId "com.lab.bracketlab"
         minSdk 21
         targetSdk 34
         versionCode 1
