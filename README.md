@@ -166,9 +166,13 @@ When folder mode is disabled, filenames also include a time prefix to reduce nam
 
 ## Device Compatibility
 
-RAW support varies by device and by camera module. Some phones expose RAW only on specific rear cameras, while others hide additional RAW-capable modules behind vendor camera IDs. BracketLab lists normal Camera2 IDs and probes additional IDs to find hidden RAW-capable modules when available.
+RAW capture support varies by device, Android version, camera module, and vendor Camera2/HAL implementation. Some phones expose RAW only on selected rear cameras, while others may hide additional manual controls, RAW streams, or camera modules behind vendor-specific compatibility rules.
 
-If a camera does not expose RAW output sizes or `RAW_SENSOR` capability, it is skipped or rejected for capture.
+BracketLab uses the neutral application package `com.lab.bracketlab` by default and does not ship with manufacturer-specific package identifiers. This keeps the public project clean, portable, and suitable for normal Android builds.
+
+Advanced users may experiment with private builds for their own devices, but any package identity changes, vendor-specific behavior, or compatibility workarounds are outside the scope of this repository. Users are responsible for ensuring that their builds comply with device policies, platform rules, and applicable terms.
+
+If a camera does not expose `RAW_SENSOR` capability or usable RAW output sizes through the public Camera2 API, BracketLab may skip that camera or reject it for capture.
 
 ## License
 
