@@ -160,6 +160,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etInterval: EditText
     private lateinit var etFocus: EditText
     private lateinit var etDelay: EditText
+    private lateinit var btnNormalStackMode: Button
+    private lateinit var btnHdrStackMode: Button
     private lateinit var btnPreview: Button
     private lateinit var btnStart: Button
     private lateinit var btnAF: Button
@@ -230,6 +232,7 @@ class MainActivity : AppCompatActivity() {
     private var focusEndReady = false
     private var exposuresKeyboardVisible = false
     private var aeBiasEv = 0.0
+    private val stackModeController = StackModeController()
     private val logEntries = mutableListOf<LogEntry>()
     private val thermalReader = ThermalReader()
     private val thermalHandler = Handler(Looper.getMainLooper())
@@ -275,6 +278,8 @@ class MainActivity : AppCompatActivity() {
         etInterval = findViewById(R.id.etInterval)
         etFocus = findViewById(R.id.etFocus)
         etDelay = findViewById(R.id.etDelay)
+        btnNormalStackMode = findViewById(R.id.btnNormalStackMode)
+        btnHdrStackMode = findViewById(R.id.btnHdrStackMode)
         btnPreview = findViewById(R.id.btnPreview)
         btnStart = findViewById(R.id.btnStart)
         btnAF = findViewById(R.id.btnAF)
@@ -322,6 +327,8 @@ class MainActivity : AppCompatActivity() {
         setupExposureShorthand()
         tvHelpContent.text = buildHelpText()
 
+        btnNormalStackMode.setOnClickListener { toggleNormalStackMode() }
+        btnHdrStackMode.setOnClickListener { toggleHdrStackMode() }
         btnPreview.setOnClickListener { toggleFramingPreview() }
         btnStart.setOnClickListener { startCapture() }
         btnAF.setOnClickListener { startAutoFocusLock() }
@@ -586,6 +593,7 @@ Starts the capture sequence using the current settings.
         etFocusFrames.setText("")
         folderModeEnabled = false
         oisEnabled = false
+        stackModeController.reset()
         selectedWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
         focusStartReady = false
         focusEndReady = false
@@ -596,6 +604,7 @@ Starts the capture sequence using the current settings.
         updateWbButton()
         updateFolderButton()
         updateOisButton()
+        updateStackModeButtons()
         applyDefaultButtonChrome()
     }
 
@@ -612,6 +621,7 @@ Starts the capture sequence using the current settings.
         updateWbButton()
         updateFolderButton()
         updateOisButton()
+        updateStackModeButtons()
         applyDefaultButtonChrome()
     }
 
@@ -731,6 +741,7 @@ Starts the capture sequence using the current settings.
         etFocusFrames.setText("")
         folderModeEnabled = false
         oisEnabled = false
+        stackModeController.reset()
         selectedWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
         focusStartReady = false
         focusEndReady = false
@@ -742,6 +753,7 @@ Starts the capture sequence using the current settings.
         updateWbButton()
         updateFolderButton()
         updateOisButton()
+        updateStackModeButtons()
         applyDefaultButtonChrome()
         saveSettings()
         log("Settings reset")
@@ -769,8 +781,51 @@ Starts the capture sequence using the current settings.
         listOf(btnAF, btnPreview, btnStart).forEach {
             applyButtonStroke(it, 0xFFFFFFFF.toInt())
         }
+        updateStackModeButtons()
         updateAeBiasButtons()
     }
+
+    /** Toggles Normal Stack mode; selecting it disables HDR Stack mode. */
+    private fun toggleNormalStackMode() {
+        if (running || liveFocusRunning) {
+            log("Capture in progress")
+            return
+        }
+        stackModeController.toggleNormal()
+        updateStackModeButtons()
+        log("Stack mode: ${stackModeLabel()}")
+    }
+
+    /** Toggles HDR Stack mode; selecting it disables Normal Stack mode. */
+    private fun toggleHdrStackMode() {
+        if (running || liveFocusRunning) {
+            log("Capture in progress")
+            return
+        }
+        stackModeController.toggleHdr()
+        updateStackModeButtons()
+        log("Stack mode: ${stackModeLabel()}")
+    }
+
+    /** Updates the stack-mode buttons with red OFF and green ON outlines. */
+    private fun updateStackModeButtons() {
+        applyButtonStroke(
+            btnNormalStackMode,
+            if (stackModeController.normalEnabled) 0xFF00FF00.toInt() else 0xFFFF0000.toInt()
+        )
+        applyButtonStroke(
+            btnHdrStackMode,
+            if (stackModeController.hdrEnabled) 0xFF00FF00.toInt() else 0xFFFF0000.toInt()
+        )
+    }
+
+    /** Gives the active stack mode a short log label. */
+    private fun stackModeLabel(): String =
+        when (stackModeController.mode) {
+            StackMode.NORMAL -> "Normal Stack"
+            StackMode.HDR -> "HDR Stack"
+            StackMode.OFF -> "OFF"
+        }
 
     /** Clears readiness flags for focus-bracket start/end values. */
     private fun clearFocusBracketLock() {
@@ -2949,6 +3004,8 @@ Starts the capture sequence using the current settings.
             btnGetHigh,
             btnGetShadow,
             btnCompute,
+            btnNormalStackMode,
+            btnHdrStackMode,
             btnPreview,
             btnStart,
             btnAF,
@@ -3086,6 +3143,8 @@ Starts the capture sequence using the current settings.
         stopFramingPreviewForCapture()
         val camId = selectedCameraId()
         btnAF.isEnabled = false; btnAF.text = "focusing..."
+        btnNormalStackMode.isEnabled = false
+        btnHdrStackMode.isEnabled = false
         btnPreview.isEnabled = false
         etCameraId.isEnabled = false
         etIso.isEnabled = false
@@ -3113,6 +3172,8 @@ Starts the capture sequence using the current settings.
                 runOnUiThread {
                     btnAF.isEnabled = true
                     btnAF.text = if (locked) "AF LOCK" else "AF"
+                    btnNormalStackMode.isEnabled = true
+                    btnHdrStackMode.isEnabled = true
                     btnPreview.isEnabled = true
                     etCameraId.isEnabled = true
                     etIso.isEnabled = true
@@ -3235,6 +3296,8 @@ Starts the capture sequence using the current settings.
         stopFramingPreviewForCapture()
         val camId = selectedCameraId()
         btnAF.isEnabled = false; btnAF.text = "focusing..."
+        btnNormalStackMode.isEnabled = false
+        btnHdrStackMode.isEnabled = false
         btnPreview.isEnabled = false
         etCameraId.isEnabled = false
         etIso.isEnabled = false
@@ -3261,6 +3324,8 @@ Starts the capture sequence using the current settings.
                 runOnUiThread {
                     btnAF.isEnabled = true
                     btnAF.text = "AF"
+                    btnNormalStackMode.isEnabled = true
+                    btnHdrStackMode.isEnabled = true
                     btnPreview.isEnabled = true
                     etCameraId.isEnabled = true
                     etIso.isEnabled = true
@@ -3466,6 +3531,8 @@ Starts the capture sequence using the current settings.
         }
 
         running = true
+        btnNormalStackMode.isEnabled = false
+        btnHdrStackMode.isEnabled = false
         btnPreview.isEnabled = false
         btnStart.isEnabled = false
         btnAF.isEnabled = false
@@ -3494,6 +3561,7 @@ Starts the capture sequence using the current settings.
         if (currentCaptureFolder != null) {
             log("Folder: $currentCaptureFolder")
         }
+        val normalStackProcessor = createNormalStackProcessor(exposures, focusValues, camId)
 
         saveQueue.clear()
         saveThread = Thread({
@@ -3511,10 +3579,14 @@ Starts the capture sequence using the current settings.
                                 job.wbGains,
                                 job.dngOrientation,
                                 job.dngOrientationDegrees,
+                                normalStackProcessor,
                                 job.slot
                             )
 
-                        SaveJob.Stop -> break@loop
+                        SaveJob.Stop -> {
+                            normalStackProcessor?.finish()
+                            break@loop
+                        }
                     }
                 }
                 log("Save complete")
@@ -3540,7 +3612,8 @@ Starts the capture sequence using the current settings.
                 }
                 try {
                     log("Saving...")
-                    saveThread?.join(120_000)
+                    val saveTimeoutMs = if (normalStackProcessor != null) 900_000L else 120_000L
+                    saveThread?.join(saveTimeoutMs)
                     if (saveThread?.isAlive == true) log("Still saving")
                 } catch (e: Exception) {
                     Log.e(TAG, "join", e)
@@ -3552,6 +3625,8 @@ Starts the capture sequence using the current settings.
                 }
                 runOnUiThread {
                     running = false
+                    btnNormalStackMode.isEnabled = true
+                    btnHdrStackMode.isEnabled = true
                     btnStart.isEnabled = true
                     btnPreview.isEnabled = true
                     btnAF.isEnabled = true
@@ -3571,6 +3646,42 @@ Starts the capture sequence using the current settings.
                 }
             }
         }, "bracketing-thread").start()
+    }
+
+    private fun createNormalStackProcessor(
+        exposures: List<Long>,
+        focusValues: List<Float>?,
+        camId: String
+    ): NormalStackProcessor? {
+        return when (stackModeController.mode) {
+            StackMode.OFF -> null
+            StackMode.HDR -> {
+                log("HDR Stack not implemented yet")
+                null
+            }
+            StackMode.NORMAL -> {
+                if (focusValues != null) {
+                    log("Normal Stack skipped: focus bracket active")
+                    null
+                } else if (exposures.distinct().size != 1) {
+                    log("Normal Stack skipped: exposures must match")
+                    null
+                } else {
+                    val stackChars = runCatching {
+                        cameraManager.getCameraCharacteristics(camId)
+                    }.getOrNull()
+                    val wbGains = whiteBalanceOptionForMode(validatedWbMode(stackChars))?.gains
+                    log("Normal Stack armed")
+                    NormalStackProcessor(
+                        applicationContext,
+                        currentCaptureFolder,
+                        stackChars,
+                        wbGains,
+                        ::log
+                    )
+                }
+            }
+        }
     }
 
     /** Captures the configured exposure/focus bracket as a RAW DNG sequence. */
@@ -3811,6 +3922,7 @@ Starts the capture sequence using the current settings.
         wbGains: RggbChannelVector?,
         dngOrientation: Int,
         dngOrientationDegrees: Int,
+        normalStackProcessor: NormalStackProcessor?,
         slot: Semaphore
     ) {
         try {
@@ -3853,6 +3965,10 @@ Starts the capture sequence using the current settings.
                     subFolder
                 ).also { it.mkdirs() }
                 FileOutputStream(File(dir, name)).use { it.write(dngBytes) }
+            }
+            normalStackProcessor?.let { processor ->
+                runCatching { processor.accept(image, result, dngOrientation, expNs, iso) }
+                    .onFailure { log("Normal Stack error: ${it.message}") }
             }
             log("Saved $name orient=${dngOrientationLabel(dngOrientation)} ${dngOrientationDegrees}deg")
         } catch (e: Exception) {
