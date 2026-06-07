@@ -4165,7 +4165,9 @@ Starts the capture sequence using the current settings.
             text.contains(" denied") ||
             text.contains("not found") ||
             text.contains("interrupted") ||
-            text.contains("timeout") ||
+            text.startsWith("lock timeout") ||
+            text.startsWith("result timeout") ||
+            text.startsWith("image timeout") ||
             text.contains("not suported") ||
             text.contains("not supported")
 
