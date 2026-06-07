@@ -23,15 +23,54 @@
             android:paddingEnd="6dp">
 
             <TextView
-                android:layout_width="0dp"
+                android:layout_width="wrap_content"
                 android:layout_height="match_parent"
-                android:layout_weight="1"
+                android:layout_marginEnd="6dp"
                 android:fontFamily="@font/cousine"
                 android:gravity="center_vertical"
                 android:text="BracketLab"
                 android:textColor="#FFFFFF"
                 android:textSize="12sp"
                 android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnNormalStackMode"
+                style="@style/DbeColumnButton"
+                android:layout_width="42dp"
+                android:layout_height="20dp"
+                android:layout_marginEnd="4dp"
+                android:background="@drawable/dbe_button"
+                android:backgroundTint="@null"
+                android:fontFamily="@font/cousine"
+                android:gravity="center"
+                android:includeFontPadding="false"
+                android:padding="0dp"
+                android:text="Normal"
+                android:textAllCaps="false"
+                android:textColor="#FFFFFF"
+                android:textSize="6sp" />
+
+            <Button
+                android:id="@+id/btnHdrStackMode"
+                style="@style/DbeColumnButton"
+                android:layout_width="32dp"
+                android:layout_height="20dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/dbe_button"
+                android:backgroundTint="@null"
+                android:fontFamily="@font/cousine"
+                android:gravity="center"
+                android:includeFontPadding="false"
+                android:padding="0dp"
+                android:text="HDR"
+                android:textAllCaps="false"
+                android:textColor="#FFFFFF"
+                android:textSize="7sp" />
+
+            <Space
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1" />
 
             <TextView
                 android:id="@+id/tvThermals"
