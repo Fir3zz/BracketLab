@@ -1804,7 +1804,9 @@ Starts the capture sequence using the current settings.
         val matrixRotationBefore = -relativeRotation.toFloat()
         val bucket = orientationBucket(physicalOrientation)
         val bucketCorrection = previewMatrixBucketCorrection(physicalOrientation)
-        val matrixRotation = matrixRotationBefore + bucketCorrection
+        val frontCorrection =
+            if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) 180f else 0f
+        val matrixRotation = matrixRotationBefore + bucketCorrection + frontCorrection
         val rightAngleRotation = normalizeDegrees(matrixRotation.roundToInt())
         val matrix = Matrix()
         val viewRect = RectF(0f, 0f, viewWidth.toFloat(), viewHeight.toFloat())
@@ -1836,7 +1838,7 @@ Starts the capture sequence using the current settings.
         val signature =
             "${size.width}x${size.height}|${viewWidth}x$viewHeight|" +
                     "$sensorOrientation|$lensFacing|$physicalOrientation|$deviceOrientation|" +
-                    "$relativeRotation|$matrixRotationBefore|$matrixRotation|" +
+                    "$relativeRotation|$matrixRotationBefore|$frontCorrection|$matrixRotation|" +
                     "${rotatedBufferWidth.roundToInt()}x${rotatedBufferHeight.roundToInt()}|$scale"
         if (signature != framingPreviewTransformSignature) {
             framingPreviewTransformSignature = signature
@@ -1846,6 +1848,7 @@ Starts the capture sequence using the current settings.
                         "sensor=$sensorOrientation facing=${lensFacingLabel(lensFacing)} " +
                         "physical=$physicalOrientation device=$deviceOrientation " +
                         "relative=$relativeRotation matrixBefore=$matrixRotationBefore " +
+                        "frontCorrection=$frontCorrection " +
                         "matrixAfter=$matrixRotation " +
                         "rotated=${rotatedBufferWidth.roundToInt()}x${rotatedBufferHeight.roundToInt()} " +
                         "scale=${"%.4f".format(Locale.US, scale)} mode=center-crop"
@@ -1906,8 +1909,20 @@ Starts the capture sequence using the current settings.
         val physicalOrientation = roundDeviceOrientationToRightAngle()
         val displayOrientation = deviceOrientationDegreesForPreviewFormula(physicalOrientation)
         val sign = if (lensFacing == CameraCharacteristics.LENS_FACING_FRONT) 1 else -1
-        return normalizeDegrees(sensorOrientation + displayOrientation * sign)
+        return normalizeDegrees(
+            sensorOrientation +
+                    displayOrientation * sign +
+                    frontFacingRotationCorrection(characteristics)
+        )
     }
+
+    /** Applies the device-specific front-camera correction needed by this app's output path. */
+    private fun frontFacingRotationCorrection(c: CameraCharacteristics): Int =
+        if (c.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT) {
+            180
+        } else {
+            0
+        }
 
     /** Maps a degree rotation to the EXIF orientation flag stored in DNG files. */
     private fun exifOrientationForDegrees(degrees: Int): Int =
@@ -3041,7 +3056,11 @@ Starts the capture sequence using the current settings.
         val sign =
             if (facing == CameraCharacteristics.LENS_FACING_FRONT) -1 else 1
 
-        return ((sensorOrientation - sign * deviceOrientation + 360) % 360).toFloat()
+        return normalizeDegrees(
+            sensorOrientation -
+                    sign * deviceOrientation +
+                    frontFacingRotationCorrection(c)
+        ).toFloat()
     }
 
     /** Rounds the current device orientation to the nearest right angle. */
