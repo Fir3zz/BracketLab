@@ -176,4 +176,9 @@ If a camera does not expose `RAW_SENSOR` capability or usable RAW output sizes t
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+BracketLab is licensed under the GNU General Public License version 3 only
+(`GPL-3.0-only`). See [LICENSE](LICENSE) for the complete terms.
+
+Anyone may use, study, modify, and redistribute the project. Distributors of
+the application or modified versions must also provide the corresponding
+source code under GPLv3.
