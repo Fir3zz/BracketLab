@@ -2,6 +2,7 @@ package com.lab.bracketlab
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -35,6 +36,44 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.lab.bracketlab.processing.model.ProcessingIntent
+import com.lab.bracketlab.processing.model.AlignToggle
+import com.lab.bracketlab.processing.model.AstroState
+import com.lab.bracketlab.processing.model.OutputDepth
+import com.lab.bracketlab.processing.model.ResolvedAlignmentMode
+import com.lab.bracketlab.processing.model.StackingConfig
+import com.lab.bracketlab.processing.model.StackingOperation
+import com.lab.bracketlab.processing.align.OpenCvDiagnostics
+import com.lab.bracketlab.processing.align.star.StarDetectionDiagnostic
+import com.lab.bracketlab.processing.align.star.StarDetectionSelfTest
+import com.lab.bracketlab.processing.align.star.StarMatchingDiagnostic
+import com.lab.bracketlab.processing.align.star.StarMatchingSelfTest
+import com.lab.bracketlab.processing.align.star.warp.StarAlignedRaw16Diagnostic
+import com.lab.bracketlab.processing.align.star.warp.StarAlignedRaw16SelfTest
+import com.lab.bracketlab.processing.calibration.DarkAggregationPolicy
+import com.lab.bracketlab.processing.calibration.DarkCalibrationInput
+import com.lab.bracketlab.processing.calibration.DarkCalibrationOptions
+import com.lab.bracketlab.processing.calibration.DarkPolicy
+import com.lab.bracketlab.processing.calibration.DarkStorageEstimator
+import com.lab.bracketlab.processing.calibration.MasterDark
+import com.lab.bracketlab.processing.calibration.MasterDarkMetadataJson
+import com.lab.bracketlab.processing.calibration.MasterDarkProcessor
+import com.lab.bracketlab.processing.calibration.MissingMasterDarkBehavior
+import com.lab.bracketlab.processing.debug.DevRawDiagnosticMode
+import com.lab.bracketlab.processing.debug.MasterDarkDiagnostic
+import com.lab.bracketlab.processing.debug.RealAlignedStackDiagnostic
+import com.lab.bracketlab.processing.hdri.HdrI32Diagnostic
+import com.lab.bracketlab.processing.hdri.HdrI32StorageEstimator
+import com.lab.bracketlab.processing.io.DcimOutputPublisher
+import com.lab.bracketlab.processing.model.DarkPolicy as StackingDarkPolicy
+import com.lab.bracketlab.processing.pipeline.CapturedRawSequence
+import com.lab.bracketlab.processing.pipeline.CapturedRawSequenceAdapter
+import com.lab.bracketlab.processing.pipeline.ProductionAlignmentMode
+import com.lab.bracketlab.processing.pipeline.ProductionOutputOptions
+import com.lab.bracketlab.processing.pipeline.ProductionStackMode
+import com.lab.bracketlab.processing.pipeline.StackModeProductionCoordinator
+import com.lab.bracketlab.processing.pipeline.StackModeProductionRequest
+import com.lab.bracketlab.processing.pipeline.StackingPlanner
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -46,6 +85,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 import android.util.Size
@@ -63,6 +103,11 @@ class MainActivity : AppCompatActivity() {
         const val REQ_PERM = 100
         private const val LIVE_FOCUS_ZOOM = 10.0f
         private const val THERMAL_UPDATE_MS = 5_000L
+        private const val DARK_THERMAL_UPDATE_MS = 1_000L
+        private const val MAX_RAW_CAPTURE_ATTEMPTS = 2
+        private const val LONG_EXPOSURE_SETTLE_THRESHOLD_NS = 1_000_000_000L
+        private const val LONG_EXPOSURE_SETTLE_MS = 300L
+        private const val EXTENDED_EXPOSURE_SETTLE_MS = 5_000L
         private const val LOG_MAX_LINES = 18
         private val LOG_WARNING_COLOR = android.graphics.Color.parseColor("#E23EE2")
         private val LOG_ERROR_COLOR = android.graphics.Color.parseColor("#C82E3E")
@@ -109,6 +154,13 @@ class MainActivity : AppCompatActivity() {
         val tone: LogTone
     )
 
+    private data class PendingDarkCaptureSession(
+        val lightSequence: CapturedRawSequence,
+        val initialCameraTemperatureCelsius: Float?,
+        val outputRelativeDirectory: String,
+        val captureFolder: String?
+    )
+
     // ── Camera ────────────────────────────────────
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
@@ -145,9 +197,20 @@ class MainActivity : AppCompatActivity() {
     private var saveThread: Thread? = null
     @Volatile
     private var running = false
+    private val capturePauseLock = Object()
+    @Volatile
+    private var capturePauseWaiting = false
     private var oisEnabled = false
     private var folderModeEnabled = false
     private var currentCaptureFolder: String? = null
+    private var currentStackOutputRelativePath: String? = null
+    @Volatile
+    private var latestCameraTemperatureCelsius: Float? = null
+    @Volatile
+    private var pendingDarkCaptureSession: PendingDarkCaptureSession? = null
+    @Volatile
+    private var darkCaptureInProgress = false
+    private var lastDarkTemperatureStatus: DarkCaptureTemperatureStatus? = null
     private var afLockedForCapture = false
     private var afLockedCamId: String? = null
     private var afLockSurface: Surface? = null
@@ -160,8 +223,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etInterval: EditText
     private lateinit var etFocus: EditText
     private lateinit var etDelay: EditText
-    private lateinit var btnNormalStackMode: Button
-    private lateinit var btnHdrStackMode: Button
+    private lateinit var btnStackModes: Button
+    private lateinit var btnDev: Button
     private lateinit var btnPreview: Button
     private lateinit var btnStart: Button
     private lateinit var btnAF: Button
@@ -206,6 +269,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var livePreview: TextureView
     private lateinit var sbLiveFocus: SeekBar
     private lateinit var previewOverlay: FrameLayout
+    private lateinit var stackModesOverlay: FrameLayout
+    private lateinit var btnStackModesClose: Button
+    private lateinit var btnModeFramesOnly: Button
+    private lateinit var btnModeStack: Button
+    private lateinit var btnModeHdri: Button
+    private lateinit var btnModeStarTrail: Button
+    private lateinit var btnAlignmentOff: Button
+    private lateinit var btnAlignmentLandscape: Button
+    private lateinit var btnAlignmentStars: Button
+    private lateinit var btnDitherOff: Button
+    private lateinit var btnDitherManual: Button
+    private lateinit var btnUseDarks: Button
+    private lateinit var btnKeepSourceFrames: Button
+    private lateinit var btnOutputDng: Button
+    private lateinit var btnOutputXisf: Button
+    private lateinit var btnOutputFits: Button
+    private lateinit var btnStackModesDefaults: Button
+    private lateinit var btnStackModesApply: Button
+    private lateinit var tvStackModesSummary: TextView
     private lateinit var helpOverlay: FrameLayout
     private lateinit var btnHelpClose: Button
     private lateinit var tvHelpContent: TextView
@@ -232,11 +314,16 @@ class MainActivity : AppCompatActivity() {
     private var focusEndReady = false
     private var exposuresKeyboardVisible = false
     private var aeBiasEv = 0.0
-    private val stackModeController = StackModeController()
+    private var stackingConfig = StackingConfig()
+    private var stackModesState = StackModesUiState()
+    private var stackModesDraft = stackModesState
     private val logEntries = mutableListOf<LogEntry>()
     private val thermalReader = ThermalReader()
     private val thermalHandler = Handler(Looper.getMainLooper())
     private val thermalExecutor = Executors.newSingleThreadExecutor()
+    private val diagnosticsExecutor = Executors.newSingleThreadExecutor()
+    @Volatile
+    private var devDiagnosticMode: DevRawDiagnosticMode? = null
     @Volatile
     private var thermalUpdatesRunning = false
     private val thermalUpdateRunnable = object : Runnable {
@@ -246,13 +333,22 @@ class MainActivity : AppCompatActivity() {
                 thermalExecutor.execute {
                     val reading = thermalReader.read()
                     runOnUiThread {
+                        latestCameraTemperatureCelsius = reading.cameraUsrCelsius
                         if (thermalUpdatesRunning && ::tvThermals.isInitialized) {
                             tvThermals.text = formatThermalReading(reading)
                         }
+                        refreshPendingDarkTemperature(reading.cameraUsrCelsius)
                     }
                 }
             }
-            thermalHandler.postDelayed(this, THERMAL_UPDATE_MS)
+            thermalHandler.postDelayed(
+                this,
+                if (pendingDarkCaptureSession != null) {
+                    DARK_THERMAL_UPDATE_MS
+                } else {
+                    THERMAL_UPDATE_MS
+                }
+            )
         }
     }
 
@@ -266,6 +362,7 @@ class MainActivity : AppCompatActivity() {
         bindViews()
         setupOrientationTracking()
         checkPermissions()
+        startOpenCvDiagnostics()
     }
 
     /** Connects XML views to fields and wires all button/listener behavior. */
@@ -278,8 +375,9 @@ class MainActivity : AppCompatActivity() {
         etInterval = findViewById(R.id.etInterval)
         etFocus = findViewById(R.id.etFocus)
         etDelay = findViewById(R.id.etDelay)
-        btnNormalStackMode = findViewById(R.id.btnNormalStackMode)
-        btnHdrStackMode = findViewById(R.id.btnHdrStackMode)
+        btnStackModes = findViewById(R.id.btnStackModes)
+        btnDev = findViewById(R.id.btnDev)
+        btnDev.visibility = if (isDebugBuild()) View.VISIBLE else View.GONE
         btnPreview = findViewById(R.id.btnPreview)
         btnStart = findViewById(R.id.btnStart)
         btnAF = findViewById(R.id.btnAF)
@@ -301,6 +399,25 @@ class MainActivity : AppCompatActivity() {
         livePreview = findViewById(R.id.livePreview)
         sbLiveFocus = findViewById(R.id.sbLiveFocus)
         previewOverlay = findViewById(R.id.previewOverlay)
+        stackModesOverlay = findViewById(R.id.stackModesOverlay)
+        btnStackModesClose = findViewById(R.id.btnStackModesClose)
+        btnModeFramesOnly = findViewById(R.id.btnModeFramesOnly)
+        btnModeStack = findViewById(R.id.btnModeStack)
+        btnModeHdri = findViewById(R.id.btnModeHdri)
+        btnModeStarTrail = findViewById(R.id.btnModeStarTrail)
+        btnAlignmentOff = findViewById(R.id.btnAlignmentOff)
+        btnAlignmentLandscape = findViewById(R.id.btnAlignmentLandscape)
+        btnAlignmentStars = findViewById(R.id.btnAlignmentStars)
+        btnDitherOff = findViewById(R.id.btnDitherOff)
+        btnDitherManual = findViewById(R.id.btnDitherManual)
+        btnUseDarks = findViewById(R.id.btnUseDarks)
+        btnKeepSourceFrames = findViewById(R.id.btnKeepSourceFrames)
+        btnOutputDng = findViewById(R.id.btnOutputDng)
+        btnOutputXisf = findViewById(R.id.btnOutputXisf)
+        btnOutputFits = findViewById(R.id.btnOutputFits)
+        btnStackModesDefaults = findViewById(R.id.btnStackModesDefaults)
+        btnStackModesApply = findViewById(R.id.btnStackModesApply)
+        tvStackModesSummary = findViewById(R.id.tvStackModesSummary)
         helpOverlay = findViewById(R.id.helpOverlay)
         btnHelpClose = findViewById(R.id.btnHelpClose)
         tvHelpContent = findViewById(R.id.tvHelpContent)
@@ -327,8 +444,63 @@ class MainActivity : AppCompatActivity() {
         setupExposureShorthand()
         tvHelpContent.text = buildHelpText()
 
-        btnNormalStackMode.setOnClickListener { toggleNormalStackMode() }
-        btnHdrStackMode.setOnClickListener { toggleHdrStackMode() }
+        btnStackModes.setOnClickListener { showStackModes() }
+        btnStackModesClose.setOnClickListener { hideStackModes() }
+        btnModeFramesOnly.setOnClickListener {
+            updateStackModesDraft(processing = StackProcessingSelection.FRAMES_ONLY)
+        }
+        btnModeStack.setOnClickListener {
+            updateStackModesDraft(processing = StackProcessingSelection.STACK)
+        }
+        btnModeHdri.setOnClickListener {
+            updateStackModesDraft(processing = StackProcessingSelection.HDR)
+        }
+        btnModeStarTrail.setOnClickListener {
+            updateStackModesDraft(processing = StackProcessingSelection.STAR_TRAIL)
+        }
+        btnAlignmentOff.setOnClickListener {
+            updateStackModesDraft(alignment = StackAlignmentSelection.OFF)
+        }
+        btnAlignmentLandscape.setOnClickListener {
+            updateStackModesDraft(alignment = StackAlignmentSelection.LANDSCAPE)
+        }
+        btnAlignmentStars.setOnClickListener {
+            updateStackModesDraft(alignment = StackAlignmentSelection.STARS)
+        }
+        btnDitherOff.setOnClickListener {
+            updateStackModesDraft(dithering = StackDitheringSelection.OFF)
+        }
+        btnDitherManual.setOnClickListener {
+            updateStackModesDraft(dithering = StackDitheringSelection.MANUAL_ASSISTED)
+        }
+        btnUseDarks.setOnClickListener {
+            stackModesDraft =
+                stackModesDraft.copy(useDarks = !stackModesDraft.useDarks).normalized()
+            updateStackModesOverlay()
+        }
+        btnKeepSourceFrames.setOnClickListener {
+            stackModesDraft =
+                stackModesDraft.copy(keepSourceFrames = !stackModesDraft.keepSourceFrames).normalized()
+            updateStackModesOverlay()
+        }
+        btnOutputDng.setOnClickListener {
+            stackModesDraft = stackModesDraft.copy(outputDng = !stackModesDraft.outputDng).normalized()
+            updateStackModesOverlay()
+        }
+        btnOutputXisf.setOnClickListener {
+            stackModesDraft = stackModesDraft.copy(outputXisf = !stackModesDraft.outputXisf).normalized()
+            updateStackModesOverlay()
+        }
+        btnOutputFits.setOnClickListener {
+            stackModesDraft = stackModesDraft.copy(outputFits = !stackModesDraft.outputFits).normalized()
+            updateStackModesOverlay()
+        }
+        btnStackModesDefaults.setOnClickListener {
+            stackModesDraft = StackModesUiState()
+            updateStackModesOverlay()
+        }
+        btnStackModesApply.setOnClickListener { applyStackModesDraft() }
+        btnDev.setOnClickListener { showDevMenu() }
         btnPreview.setOnClickListener { toggleFramingPreview() }
         btnStart.setOnClickListener { startCapture() }
         btnAF.setOnClickListener { startAutoFocusLock() }
@@ -378,6 +550,612 @@ class MainActivity : AppCompatActivity() {
         thermalExecutor.shutdownNow()
     }
 
+    /** Updates the post-light dark-capture gate from the latest camera-usr reading. */
+    private fun refreshPendingDarkTemperature(currentCelsius: Float?) {
+        val pending = pendingDarkCaptureSession ?: return
+        if (darkCaptureInProgress || running || !::btnStart.isInitialized) return
+        val decision =
+            DarkCaptureTemperatureGate.evaluate(
+                pending.initialCameraTemperatureCelsius,
+                currentCelsius
+            )
+        btnStart.isEnabled = true
+        when (decision.status) {
+            DarkCaptureTemperatureStatus.WAITING -> {
+                btnStart.text = "Capture Darks\nWarning: Temperature"
+                applyButtonStroke(btnStart, 0xFFFFFF00.toInt())
+            }
+            DarkCaptureTemperatureStatus.READY -> {
+                btnStart.text = "Capture Darks\nTemperature Ready"
+                applyButtonStroke(btnStart, 0xFF00FF00.toInt())
+            }
+            DarkCaptureTemperatureStatus.UNAVAILABLE -> {
+                btnStart.text = "Capture Darks\nTemperature unavailable"
+                applyButtonStroke(btnStart, 0xFFFFFF00.toInt())
+            }
+        }
+        if (decision.status != lastDarkTemperatureStatus) {
+            lastDarkTemperatureStatus = decision.status
+            when (decision.status) {
+                DarkCaptureTemperatureStatus.WAITING ->
+                    log(
+                        "Warning: wait for camera-usr to cool to ${
+                            formatTemperatureForLog(decision.readyLimitCelsius)
+                        }; current ${formatTemperatureForLog(decision.currentCelsius)}"
+                    )
+                DarkCaptureTemperatureStatus.READY ->
+                    log(
+                        "Temperature Ready: camera-usr ${
+                            formatTemperatureForLog(decision.currentCelsius)
+                        }. Cover the lens and press Capture Darks"
+                    )
+                DarkCaptureTemperatureStatus.UNAVAILABLE ->
+                    log(
+                        "Warning: camera-usr unavailable; temperature matching cannot be verified"
+                    )
+            }
+        }
+    }
+
+    /** Blocks a dark capture while camera-usr is still warmer than the light-session baseline. */
+    private fun pendingDarkCaptureMayStart(): Boolean {
+        val pending = pendingDarkCaptureSession ?: return false
+        val decision =
+            DarkCaptureTemperatureGate.evaluate(
+                pending.initialCameraTemperatureCelsius,
+                latestCameraTemperatureCelsius
+            )
+        return when (decision.status) {
+            DarkCaptureTemperatureStatus.READY -> true
+            DarkCaptureTemperatureStatus.UNAVAILABLE -> {
+                log("Warning: starting darks without camera-usr temperature verification")
+                true
+            }
+            DarkCaptureTemperatureStatus.WAITING -> {
+                log(
+                    "Warning: camera-usr is ${formatTemperatureForLog(decision.currentCelsius)}; " +
+                        "wait for ${formatTemperatureForLog(decision.readyLimitCelsius)}"
+                )
+                refreshPendingDarkTemperature(latestCameraTemperatureCelsius)
+                false
+            }
+        }
+    }
+
+    private fun formatTemperatureForLog(value: Float?): String =
+        value?.let { String.format(Locale.US, "%.1f°C", it) } ?: "--°C"
+
+    /** Runs the native OpenCV smoke test without blocking the UI thread. */
+    private fun startOpenCvDiagnostics() {
+        diagnosticsExecutor.execute {
+            OpenCvDiagnostics.runPhaseCorrelationCheck().forEach { log(it) }
+        }
+    }
+
+    /** Shows the temporary debug menu used while backend prompts are under development. */
+    private fun showDevMenu() {
+        if (!isDebugBuild()) return
+        val popup = PopupMenu(this, btnDev)
+        popup.menu.add(0, 1, 0, "Arm aligned RAW test")
+        popup.menu.add(0, 2, 1, "Capture MasterDark")
+        popup.menu.add(0, 3, 2, "Apply MasterDark")
+        popup.menu.add(0, 4, 3, "Run HDR Masters + Linear RGB DNG")
+        popup.menu.add(0, 5, 4, "Run Star Detection Diagnostic")
+        popup.menu.add(0, 8, 5, "Run Star Matching / RANSAC Diagnostic")
+        popup.menu.add(0, 9, 6, "Run Star-Aligned RAW16 Stack")
+        popup.menu.add(0, 6, 7, "Cancel armed test")
+            .isEnabled = devDiagnosticMode != null
+        popup.menu.add(0, 7, 8, "Run backend self-tests")
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.ALIGNED_STACK)
+                    true
+                }
+                2 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.CAPTURE_MASTER_DARK)
+                    true
+                }
+                3 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.APPLY_MASTER_DARK)
+                    true
+                }
+                4 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.HDRI32_MERGE)
+                    true
+                }
+                5 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.STAR_DETECTION)
+                    true
+                }
+                8 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.STAR_MATCHING)
+                    true
+                }
+                9 -> {
+                    armDevDiagnostic(DevRawDiagnosticMode.STAR_ALIGNED_STACK)
+                    true
+                }
+                6 -> {
+                    devDiagnosticMode = null
+                    updateDevButton()
+                    log("DEV diagnostic cancelled")
+                    true
+                }
+                7 -> {
+                    log("DEV backend self-tests started")
+                    startOpenCvDiagnostics()
+                    diagnosticsExecutor.execute {
+                        StarDetectionSelfTest.runAll().logLines().forEach { log(it) }
+                        StarMatchingSelfTest.runAll().logLines().forEach { log(it) }
+                        StarAlignedRaw16SelfTest.runAll().logLines().forEach { log(it) }
+                    }
+                    true
+                }
+                else -> false
+            }
+        }
+        popup.show()
+    }
+
+    /** Arms one debug-only real-capture diagnostic for the next RAW sequence. */
+    private fun armDevDiagnostic(mode: DevRawDiagnosticMode) {
+        if (
+            running ||
+            liveFocusRunning ||
+            RealAlignedStackDiagnostic.isProcessing() ||
+            MasterDarkDiagnostic.isProcessing() ||
+            HdrI32Diagnostic.isProcessing() ||
+            StarDetectionDiagnostic.isProcessing() ||
+            StarMatchingDiagnostic.isProcessing() ||
+            StarAlignedRaw16Diagnostic.isProcessing()
+        ) {
+            log("DEV diagnostic unavailable during capture or processing")
+            return
+        }
+        devDiagnosticMode = mode
+        updateDevButton()
+        log("DEV diagnostic armed: ${devModeLabel(mode)}")
+        when (mode) {
+            DevRawDiagnosticMode.ALIGNED_STACK ->
+                log("Next capture: use >=7 same-exposure RAW frames")
+            DevRawDiagnosticMode.CAPTURE_MASTER_DARK ->
+                log("Cover the lens and capture >=7 fixed ISO/exposure frames")
+            DevRawDiagnosticMode.APPLY_MASTER_DARK ->
+                log("Capture lights with the same camera, ISO and exposure")
+            DevRawDiagnosticMode.HDRI32_MERGE ->
+                log("Next capture: fixed ISO with at least 2 different exposures")
+            DevRawDiagnosticMode.STAR_DETECTION ->
+                log("Next capture: fixed exposure/focus star sequence; no stack will be written")
+            DevRawDiagnosticMode.STAR_MATCHING ->
+                log("Next capture: use >=3 fixed exposure/focus star frames; only transforms will be reported")
+            DevRawDiagnosticMode.STAR_ALIGNED_STACK ->
+                log("Next capture: use >=3 fixed exposure/focus star frames; one aligned Bayer DNG will be written")
+        }
+    }
+
+    /** Creates the safe RAW-sequence adapter used only by the developer validation path. */
+    private fun prepareDevAlignedStackAdapter(camId: String): CapturedRawSequenceAdapter? {
+        val mode = devDiagnosticMode
+        if (!isDebugBuild() || mode == null) return null
+        devDiagnosticMode = null
+        updateDevButton()
+        val c = runCatching { cameraManager.getCameraCharacteristics(camId) }
+            .onFailure { log("DEV camera metadata error: ${it.message}") }
+            .getOrNull()
+            ?: return null
+        val folderTag = currentCaptureFolder ?: SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())
+        val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        val outputDir = File(baseDir, "BracketLab_DEV_$folderTag")
+        log("DEV output: ${outputDir.absolutePath}")
+        return CapturedRawSequenceAdapter(
+            cameraId = camId,
+            cameraCharacteristics = c,
+            outputDirectoryPath = outputDir.absolutePath,
+            diagnosticMode = mode,
+            hdriDarkCalibrationRequested =
+                stackingConfig.darkPolicy != StackingDarkPolicy.OFF
+        )
+    }
+
+    /** Creates the file-backed capture adapter for a committed Stack Modes job. */
+    private fun prepareProductionStackAdapter(camId: String): CapturedRawSequenceAdapter? {
+        if (stackModesState.processing == StackProcessingSelection.FRAMES_ONLY) return null
+        val cameraCharacteristics =
+            runCatching { cameraManager.getCameraCharacteristics(camId) }
+                .onFailure { log("Stack Modes camera metadata error: ${it.message}") }
+                .getOrNull()
+                ?: return null
+        val session =
+            currentCaptureFolder
+                ?: StackModeProductionCoordinator.sessionName(System.currentTimeMillis())
+        val base = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        val workBase = File(base, "BracketLab_Work")
+        cleanupStaleProductionWork(workBase)
+        val working = File(workBase, session)
+        log("Stack Modes working storage: ${working.absolutePath}")
+        return CapturedRawSequenceAdapter(
+            cameraId = camId,
+            cameraCharacteristics = cameraCharacteristics,
+            outputDirectoryPath = working.absolutePath,
+            diagnosticMode = null
+        )
+    }
+
+    /** Creates an isolated file-backed adapter for same-session dark frames. */
+    private fun prepareProductionDarkAdapter(camId: String): CapturedRawSequenceAdapter? {
+        val cameraCharacteristics =
+            runCatching { cameraManager.getCameraCharacteristics(camId) }
+                .onFailure { log("Stack Modes dark metadata error: ${it.message}") }
+                .getOrNull()
+                ?: return null
+        val pending = pendingDarkCaptureSession ?: return null
+        val base = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        val working =
+            File(
+                base,
+                "BracketLab_Work${File.separator}${pending.captureFolder ?: "session"}" +
+                    "${File.separator}darks"
+            )
+        log("Stack Modes dark working storage: ${working.absolutePath}")
+        return CapturedRawSequenceAdapter(
+            cameraId = camId,
+            cameraCharacteristics = cameraCharacteristics,
+            outputDirectoryPath = working.absolutePath,
+            diagnosticMode = null,
+            isDarkCalibrationSequence = true
+        )
+    }
+
+    /** Runs the selected production backend after every RAW and metadata pair is safely stored. */
+    private fun runProductionStackMode(
+        sequence: CapturedRawSequence,
+        masterDark: MasterDark? = null
+    ) {
+        val relativePath =
+            currentStackOutputRelativePath
+                ?: run {
+                    log("Stack Modes output folder is unavailable")
+                    sequence.cleanupTemporaryRawFrames()
+                    return
+                }
+        val mode =
+            when (stackModesState.processing) {
+                StackProcessingSelection.STACK -> ProductionStackMode.STACK
+                StackProcessingSelection.HDR -> ProductionStackMode.HDR
+                StackProcessingSelection.STAR_TRAIL -> ProductionStackMode.STAR_TRAIL
+                StackProcessingSelection.FRAMES_ONLY -> {
+                    sequence.cleanupTemporaryRawFrames()
+                    return
+                }
+            }
+        val alignment =
+            when (stackModesState.alignment) {
+                StackAlignmentSelection.OFF -> ProductionAlignmentMode.OFF
+                StackAlignmentSelection.LANDSCAPE -> ProductionAlignmentMode.LANDSCAPE
+                StackAlignmentSelection.STARS -> ProductionAlignmentMode.STARS
+            }
+        log(
+            "Processing ${sequence.frameCount} frames: " +
+                "${stackModesState.processing.name}/${stackModesState.alignment.name}"
+        )
+        val result =
+            StackModeProductionCoordinator(applicationContext).process(
+                StackModeProductionRequest(
+                    sequence = sequence,
+                    mode = mode,
+                    alignment = alignment,
+                    outputs =
+                        ProductionOutputOptions(
+                            dng = stackModesState.outputDng,
+                            xisf = stackModesState.outputXisf,
+                            fits = stackModesState.outputFits
+                        ),
+                    dcimRelativeDirectory = relativePath,
+                    workingDirectory = File(sequence.outputDirectoryPath, ".production"),
+                    darkCalibration =
+                        masterDark?.let {
+                            DarkCalibrationInput.use(
+                                it,
+                                DarkCalibrationOptions(
+                                    darkPolicy = DarkPolicy.USE_COMPATIBLE_MASTER_DARK,
+                                    missingMasterDarkBehavior = MissingMasterDarkBehavior.FAIL
+                                )
+                            )
+                        } ?: DarkCalibrationInput.OFF
+                )
+            )
+        result.warnings.forEach { log("Warning: $it") }
+        result.outputs.forEach {
+            if (it.success) {
+                val destination =
+                    it.storageDirectory ?: it.path ?: it.uri?.toString() ?: relativePath
+                log(
+                    "Saved ${it.displayName} " +
+                        "(${it.bytes} bytes) to $destination"
+                )
+            } else {
+                log("Output failed ${it.displayName}: ${it.failureMessage}")
+            }
+        }
+        log(
+            if (result.success) {
+                "Stack Modes processing complete"
+            } else {
+                "Stack Modes processing failed: ${result.failureMessage}"
+            }
+        )
+        val workRoot = File(sequence.outputDirectoryPath)
+        val workCleaned =
+            runCatching {
+                !workRoot.exists() || workRoot.deleteRecursively()
+            }.getOrDefault(false)
+        val workBase = workRoot.parentFile
+        if (workCleaned && workBase?.listFiles()?.isEmpty() == true) {
+            runCatching { workBase.delete() }
+        }
+        log("Stack Modes temporary storage cleanup=$workCleaned")
+    }
+
+    /** Removes abandoned production work from earlier completed or failed sessions. */
+    private fun cleanupStaleProductionWork(workBase: File) {
+        if (!workBase.exists()) return
+        val cleaned =
+            runCatching {
+                workBase.listFiles()
+                    ?.fold(true) { success, child ->
+                        (!child.exists() || child.deleteRecursively()) && success
+                    } ?: false
+            }.getOrDefault(false)
+        if (cleaned && workBase.listFiles()?.isEmpty() == true) {
+            runCatching { workBase.delete() }
+        }
+        log("Stale Stack Modes work cleanup=$cleaned")
+    }
+
+    /** Holds completed lights until temperature-matched darks are captured. */
+    private fun armPendingDarkCapture(
+        lightSequence: CapturedRawSequence,
+        initialCameraTemperatureCelsius: Float?
+    ) {
+        if (lightSequence.frameCount <= 0) {
+            log("Dark calibration cancelled: no light frames were retained")
+            lightSequence.cleanupTemporaryRawFrames()
+            return
+        }
+        pendingDarkCaptureSession =
+            PendingDarkCaptureSession(
+                lightSequence = lightSequence,
+                initialCameraTemperatureCelsius = initialCameraTemperatureCelsius,
+                outputRelativeDirectory =
+                    currentStackOutputRelativePath ?: "DCIM/BracketLab/Stack",
+                captureFolder = currentCaptureFolder
+            )
+        lastDarkTemperatureStatus = null
+        log("Light frames complete: ${lightSequence.frameCount}")
+        log(
+            "Light start camera-usr: " +
+                formatTemperatureForLog(initialCameraTemperatureCelsius)
+        )
+        log("Wait for Temperature Ready, cover the lens, then press Capture Darks")
+    }
+
+    /** Builds and stores a same-session MasterDark, then processes the retained lights. */
+    private fun completeDarkCalibrationAndProcess(darkSequence: CapturedRawSequence) {
+        val pending = pendingDarkCaptureSession
+            ?: run {
+                log("Dark calibration failed: retained light session is unavailable")
+                darkSequence.cleanupTemporaryRawFrames()
+                return
+            }
+        val lightSequence = pending.lightSequence
+        val working =
+            File(darkSequence.outputDirectoryPath, ".masterdark_build").also(File::mkdirs)
+        var completed = false
+        try {
+            require(darkSequence.frameCount == lightSequence.frameCount) {
+                "Dark frame count ${darkSequence.frameCount} differs from light frame count ${lightSequence.frameCount}."
+            }
+            log("Creating MasterDark from ${darkSequence.frameCount} frames")
+            val created =
+                MasterDarkProcessor(working).createMasterDark(
+                    darkSequence.toRawStack(),
+                    DarkCalibrationOptions(
+                        darkPolicy = DarkPolicy.CAPTURE_MASTER_DARK,
+                        aggregationPolicy = DarkAggregationPolicy.AUTO,
+                        minimumDarkFrames = 1,
+                        allowSingleDarkFrame = true,
+                        appVersion = null
+                    )
+                )
+            require(created.success && created.masterDark != null) {
+                created.failureMessage ?: created.failureCode?.name ?: "MasterDark creation failed."
+            }
+            val masterDark = created.masterDark
+            publishMasterDarkArtifacts(masterDark, working)
+            log(
+                "MasterDark ready: ${masterDark.metadata.frameCount} frames, " +
+                    "ISO ${masterDark.metadata.iso}, " +
+                    "${fmtExpNs(masterDark.metadata.exposureTimeNs)}"
+            )
+            log(
+                "Dark capture camera-usr: " +
+                    formatTemperatureForLog(latestCameraTemperatureCelsius)
+            )
+            currentStackOutputRelativePath = pending.outputRelativeDirectory
+            currentCaptureFolder = pending.captureFolder
+            runProductionStackMode(lightSequence, masterDark)
+            completed = true
+        } catch (error: Throwable) {
+            Log.e(TAG, "completeDarkCalibrationAndProcess", error)
+            log("Dark calibration failed: ${error.message}")
+            log("Retained light frames are still available; retry Capture Darks")
+        } finally {
+            darkSequence.cleanupTemporaryRawFrames()
+            runCatching {
+                if (working.exists()) working.deleteRecursively()
+            }
+            if (completed) pendingDarkCaptureSession = null
+            darkCaptureInProgress = false
+            if (completed) lastDarkTemperatureStatus = null
+        }
+    }
+
+    /** Publishes the same-session MasterDark RAW and sidecar into public Documents. */
+    private fun publishMasterDarkArtifacts(masterDark: MasterDark, workingDirectory: File) {
+        val metadata = masterDark.metadata
+        val camera = (metadata.cameraId ?: "unknown").replace(Regex("[^A-Za-z0-9_.-]"), "_")
+        val relativeDirectory =
+            "Documents/BracketLab/MasterDarks/camera_$camera/" +
+                "ISO_${metadata.iso}/EXP_${metadata.exposureTimeNs}ns"
+        val metadataFile =
+            File(workingDirectory, "${metadata.id}.json").apply {
+                writeText(MasterDarkMetadataJson.encode(metadata), Charsets.UTF_8)
+            }
+        val publisher = DcimOutputPublisher(applicationContext)
+        val outputs =
+            listOf(
+                publisher.publish(
+                    source = masterDark.rawFile,
+                    relativeDirectory = relativeDirectory,
+                    displayName = metadata.rawFilename
+                ),
+                publisher.publish(
+                    source = metadataFile,
+                    relativeDirectory = relativeDirectory,
+                    displayName = metadataFile.name,
+                    mimeType = "application/json"
+                )
+            )
+        outputs.forEach { output ->
+            if (output.success) {
+                log(
+                    "Saved ${output.displayName} (${output.bytes} bytes) to " +
+                        (output.storageDirectory ?: relativeDirectory)
+                )
+            } else {
+                log("MasterDark output failed ${output.displayName}: ${output.failureMessage}")
+            }
+        }
+    }
+
+    /** Maps each production mode to a stable session tree used by DCIM and Documents outputs. */
+    private fun stackModeDcimRelativePath(session: String): String {
+        val category =
+            when {
+                stackModesState.processing == StackProcessingSelection.HDR -> "HDR"
+                stackModesState.processing == StackProcessingSelection.STAR_TRAIL ->
+                    "Astro/StarTrail"
+                stackModesState.processing == StackProcessingSelection.STACK &&
+                    stackModesState.alignment == StackAlignmentSelection.STARS -> "Astro"
+                stackModesState.processing == StackProcessingSelection.STACK &&
+                    stackModesState.alignment == StackAlignmentSelection.LANDSCAPE -> "Landscape"
+                stackModesState.processing == StackProcessingSelection.STACK -> "Stack"
+                else -> "Frames"
+            }
+        return "DCIM/BracketLab/$category/$session"
+    }
+
+    /** Runs the selected real RAW diagnostic after the save queue drains. */
+    private fun runDevAlignedStackDiagnostic(adapter: CapturedRawSequenceAdapter) {
+        val diagnosticMode = adapter.diagnosticMode ?: return
+        val sequence = adapter.snapshot()
+        log("DEV ${devModeLabel(diagnosticMode)} processing ${sequence.frameCount} frames")
+        when (diagnosticMode) {
+            DevRawDiagnosticMode.ALIGNED_STACK -> {
+                val result = RealAlignedStackDiagnostic().run(sequence)
+                result.logLines.forEach { log(it) }
+                log(if (result.success) "DEV aligned validation PASS" else "DEV aligned validation FAIL")
+            }
+            DevRawDiagnosticMode.CAPTURE_MASTER_DARK -> {
+                val result = MasterDarkDiagnostic(masterDarkRoot()).capture(sequence)
+                result.logLines.forEach { log(it) }
+                log(if (result.success) "DEV MasterDark creation PASS" else "DEV MasterDark creation FAIL")
+            }
+            DevRawDiagnosticMode.APPLY_MASTER_DARK -> {
+                val result = MasterDarkDiagnostic(masterDarkRoot()).apply(sequence)
+                result.logLines.forEach { log(it) }
+                log(if (result.success) "DEV MasterDark application PASS" else "DEV MasterDark application FAIL")
+            }
+            DevRawDiagnosticMode.HDRI32_MERGE -> {
+                val result = HdrI32Diagnostic(hdri32Root()).run(
+                    sequence,
+                    darkCalibrationRequested = adapter.hdriDarkCalibrationRequested
+                )
+                result.logLines.forEach { log(it) }
+                log(
+                    if (result.success) {
+                        "DEV HDR masters + Linear RGB DNG PASS"
+                    } else {
+                        "DEV HDR masters + Linear RGB DNG FAIL"
+                    }
+                )
+            }
+            DevRawDiagnosticMode.STAR_DETECTION -> {
+                val result = StarDetectionDiagnostic(starDetectionRoot()).run(sequence)
+                result.logLines.forEach { log(it) }
+                log(
+                    if (result.success) {
+                        "DEV star detection PASS"
+                    } else {
+                        "DEV star detection FAIL"
+                    }
+                )
+            }
+            DevRawDiagnosticMode.STAR_MATCHING -> {
+                val result = StarMatchingDiagnostic(starDetectionRoot()).run(sequence)
+                result.logLines.forEach { log(it) }
+                log(
+                    if (result.success) {
+                        "DEV star matching / RANSAC PASS"
+                    } else {
+                        "DEV star matching / RANSAC FAIL"
+                    }
+                )
+            }
+            DevRawDiagnosticMode.STAR_ALIGNED_STACK -> {
+                val result = StarAlignedRaw16Diagnostic(starDetectionRoot()).run(sequence)
+                result.logLines.forEach { log(it) }
+                log(
+                    if (result.success) {
+                        "DEV star-aligned RAW16 stack PASS"
+                    } else {
+                        "DEV star-aligned RAW16 stack FAIL"
+                    }
+                )
+            }
+        }
+    }
+
+    private fun masterDarkRoot(): File {
+        val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        return File(baseDir, "BracketLab_MasterDarks")
+    }
+
+    private fun hdri32Root(): File {
+        val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        return File(baseDir, "BracketLab_HDR32")
+    }
+
+    private fun starDetectionRoot(): File {
+        val baseDir = getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS) ?: filesDir
+        return File(baseDir, "BracketLab_StarAlign")
+    }
+
+    private fun devModeLabel(mode: DevRawDiagnosticMode): String =
+        when (mode) {
+            DevRawDiagnosticMode.ALIGNED_STACK -> "aligned RAW"
+            DevRawDiagnosticMode.CAPTURE_MASTER_DARK -> "MasterDark capture"
+            DevRawDiagnosticMode.APPLY_MASTER_DARK -> "MasterDark apply"
+            DevRawDiagnosticMode.HDRI32_MERGE -> "HDR masters + Linear RGB DNG"
+            DevRawDiagnosticMode.STAR_DETECTION -> "star detection"
+            DevRawDiagnosticMode.STAR_MATCHING -> "star matching / RANSAC"
+            DevRawDiagnosticMode.STAR_ALIGNED_STACK -> "star-aligned RAW16 stack"
+        }
+
+    private fun isDebugBuild(): Boolean =
+        (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+
     /** Formats both thermal sensors into the compact status label. */
     private fun formatThermalReading(reading: ThermalReader.Reading): String =
         "skin: ${formatThermalValue(reading.skinCelsius)} camera-usr: ${formatThermalValue(reading.cameraUsrCelsius)}"
@@ -388,6 +1166,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Displays the in-app help overlay above the capture controls. */
     private fun showHelp() {
+        if (::stackModesOverlay.isInitialized) stackModesOverlay.visibility = View.GONE
         helpOverlay.visibility = View.VISIBLE
         helpOverlay.bringToFront()
     }
@@ -404,7 +1183,7 @@ BRACKETLAB HELP
 SUGGESTED USE
 
 1. Select the Camera ID first.
-2. Set WB, OIS, ISO, focus, interval, and delay.
+2. Set WB, OIS, ISO, focus, frame gap, and delay.
 3. Use Preview, AE, AF, Get, or Compute only after the correct camera is selected.
 4. For stacking, keep exposure and focus stable between frames.
 5. For tripod work, use OIS OFF when possible.
@@ -550,11 +1329,25 @@ Touching preview closes it.
 CAPTURE
 
 Starts the capture sequence using the current settings.
+
+Exposure pause:
+Use pause(n) with repeated exposures, for example:
+15+8, pause(4)
+
+After four frames, Capture becomes a green Resume button. Move the tripod if
+needed, then press Resume to continue without closing the capture session.
 """.trimIndent()
 
     @Suppress("DEPRECATION")
     /** Closes overlays first, then falls back to the normal Android back action. */
     override fun onBackPressed() {
+        if (
+            ::stackModesOverlay.isInitialized &&
+            stackModesOverlay.visibility == View.VISIBLE
+        ) {
+            hideStackModes()
+            return
+        }
         if (::helpOverlay.isInitialized && helpOverlay.visibility == View.VISIBLE) {
             hideHelp()
             return
@@ -593,7 +1386,9 @@ Starts the capture sequence using the current settings.
         etFocusFrames.setText("")
         folderModeEnabled = false
         oisEnabled = false
-        stackModeController.reset()
+        stackingConfig = StackingConfig.DEFAULT
+        stackModesState = StackModesUiState()
+        stackModesDraft = stackModesState
         selectedWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
         focusStartReady = false
         focusEndReady = false
@@ -674,7 +1469,7 @@ Starts the capture sequence using the current settings.
     private fun expandExposureShorthand() {
         if (restoringSettings) return
         val original = etExposures.text.toString()
-        if ('+' !in original) return
+        if ('+' !in original && !original.contains("pause", ignoreCase = true)) return
 
         val expanded = buildExpandedExposures(original)
             ?: run {
@@ -685,32 +1480,20 @@ Starts the capture sequence using the current settings.
         if (expanded == original.trim()) return
         etExposures.setText(expanded)
         etExposures.setSelection(etExposures.text.length)
-        tvBrackets.text = "${expanded.lines().count { it.isNotBlank() }} frames"
+        val sequence = ExposureSequenceParser.parse(expanded, ::parseExpString)
+        tvBrackets.text =
+            sequence?.let {
+                buildString {
+                    append("${it.exposureCount} frames")
+                    if (it.pauseCount > 0) append(" / ${it.pauseCount} pause")
+                }
+            } ?: "-"
         saveSettings()
     }
 
-    /** Parses shorthand like "1/30+3" and returns the expanded exposure list. */
-    private fun buildExpandedExposures(text: String): String? {
-        val output = mutableListOf<String>()
-        text.split(Regex("[,\\r\\n]+"))
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .forEach { token ->
-                val plusIndex = token.lastIndexOf('+')
-                if (plusIndex < 0) {
-                    output += token
-                    return@forEach
-                }
-
-                val exposure = token.substring(0, plusIndex).trim()
-                val count = token.substring(plusIndex + 1).trim().toIntOrNull()
-                if (exposure.isEmpty() || count == null || count <= 0) return null
-                if (parseExpString(exposure) == null) return null
-                repeat(count) { output += exposure }
-            }
-
-        return output.takeIf { it.isNotEmpty() }?.joinToString("\n")
-    }
+    /** Expands exposure repetition and optional pause(n) markers. */
+    private fun buildExpandedExposures(text: String): String? =
+        ExposureSequenceParser.expand(text, ::parseExpString)
 
     /** Persists the current UI settings unless a restore is in progress. */
     private fun saveSettings() {
@@ -741,7 +1524,7 @@ Starts the capture sequence using the current settings.
         etFocusFrames.setText("")
         folderModeEnabled = false
         oisEnabled = false
-        stackModeController.reset()
+        stackingConfig = StackingConfig.DEFAULT
         selectedWbMode = CaptureRequest.CONTROL_AWB_MODE_AUTO
         focusStartReady = false
         focusEndReady = false
@@ -785,47 +1568,224 @@ Starts the capture sequence using the current settings.
         updateAeBiasButtons()
     }
 
-    /** Toggles Normal Stack mode; selecting it disables HDR Stack mode. */
-    private fun toggleNormalStackMode() {
+    /** Opens the large Stack Modes editor with a disposable draft state. */
+    private fun showStackModes() {
+        if (pendingDarkCaptureSession != null) {
+            log("Finish the pending dark calibration session first")
+            return
+        }
         if (running || liveFocusRunning) {
             log("Capture in progress")
             return
         }
-        stackModeController.toggleNormal()
-        updateStackModeButtons()
-        log("Stack mode: ${stackModeLabel()}")
+        stopFramingPreviewForCapture()
+        if (::helpOverlay.isInitialized) helpOverlay.visibility = View.GONE
+        stackModesDraft = stackModesState
+        updateStackModesOverlay()
+        stackModesOverlay.visibility = View.VISIBLE
+        stackModesOverlay.bringToFront()
     }
 
-    /** Toggles HDR Stack mode; selecting it disables Normal Stack mode. */
-    private fun toggleHdrStackMode() {
-        if (running || liveFocusRunning) {
-            log("Capture in progress")
-            return
+    /** Closes Stack Modes and discards changes that were not applied. */
+    private fun hideStackModes() {
+        stackModesDraft = stackModesState
+        stackModesOverlay.visibility = View.GONE
+    }
+
+    /** Replaces selected portions of the Stack Modes draft and reapplies constraints. */
+    private fun updateStackModesDraft(
+        processing: StackProcessingSelection? = null,
+        alignment: StackAlignmentSelection? = null,
+        dithering: StackDitheringSelection? = null
+    ) {
+        stackModesDraft =
+            stackModesDraft.copy(
+                processing = processing ?: stackModesDraft.processing,
+                alignment = alignment ?: stackModesDraft.alignment,
+                dithering = dithering ?: stackModesDraft.dithering
+            ).normalized()
+        updateStackModesOverlay()
+    }
+
+    /** Commits the UI selection and maps currently supported choices to StackingConfig. */
+    private fun applyStackModesDraft() {
+        stackModesState = stackModesDraft.normalized()
+        val starAlignment = stackModesState.alignment == StackAlignmentSelection.STARS
+        val landscapeAlignment = stackModesState.alignment == StackAlignmentSelection.LANDSCAPE
+        stackingConfig =
+            stackingConfig.copy(
+                operation =
+                    when (stackModesState.processing) {
+                        StackProcessingSelection.STACK -> StackingOperation.NORMAL
+                        StackProcessingSelection.HDR -> StackingOperation.HDRI
+                        StackProcessingSelection.FRAMES_ONLY,
+                        StackProcessingSelection.STAR_TRAIL -> StackingOperation.OFF
+                    },
+                outputDepth =
+                    if (stackModesState.processing == StackProcessingSelection.HDR) {
+                        OutputDepth.FLOAT32_32F
+                    } else {
+                        OutputDepth.RAW16_16I
+                    },
+                alignToggle =
+                    if (landscapeAlignment) AlignToggle.AUTO else AlignToggle.OFF,
+                astroState =
+                    if (starAlignment) AstroState.STAR else AstroState.OFF,
+                darkPolicy =
+                    if (stackModesState.useDarks) {
+                        StackingDarkPolicy.USE_COMPATIBLE_MASTER_DARK
+                    } else {
+                        StackingDarkPolicy.OFF
+                    }
+            )
+        updateStackModeButtons()
+        hideStackModes()
+        log("Stack Modes: ${stackModesLogLabel(stackModesState)}")
+        if (stackModesState.dithering != StackDitheringSelection.OFF) {
+            log("Manual dithering armed; use pause in the exposure list")
         }
-        stackModeController.toggleHdr()
-        updateStackModeButtons()
-        log("Stack mode: ${stackModeLabel()}")
+        if (stackModesState.processing == StackProcessingSelection.STAR_TRAIL) {
+            log("Star Trail uses a fixed-camera maximum RAW16 composite")
+        }
     }
 
-    /** Updates the stack-mode buttons with red OFF and green ON outlines. */
+    /** Refreshes every Stack Modes button, constraint and result summary. */
+    private fun updateStackModesOverlay() {
+        stackModesDraft = stackModesDraft.normalized()
+        val state = stackModesDraft
+        val starTrail = state.processing == StackProcessingSelection.STAR_TRAIL
+        val hdr = state.processing == StackProcessingSelection.HDR
+        val framesOnly = state.processing == StackProcessingSelection.FRAMES_ONLY
+        val manualDitherAllowed =
+            !starTrail &&
+                (framesOnly || state.alignment == StackAlignmentSelection.STARS)
+
+        setStackModeChoice(btnModeFramesOnly, state.processing == StackProcessingSelection.FRAMES_ONLY)
+        setStackModeChoice(btnModeStack, state.processing == StackProcessingSelection.STACK)
+        setStackModeChoice(btnModeHdri, hdr)
+        setStackModeChoice(btnModeStarTrail, starTrail)
+
+        setStackModeChoice(btnAlignmentOff, state.alignment == StackAlignmentSelection.OFF, !starTrail)
+        setStackModeChoice(
+            btnAlignmentLandscape,
+            state.alignment == StackAlignmentSelection.LANDSCAPE,
+            !starTrail
+        )
+        setStackModeChoice(
+            btnAlignmentStars,
+            state.alignment == StackAlignmentSelection.STARS,
+            !starTrail && !hdr
+        )
+
+        setStackModeChoice(btnDitherOff, state.dithering == StackDitheringSelection.OFF)
+        setStackModeChoice(
+            btnDitherManual,
+            state.dithering == StackDitheringSelection.MANUAL_ASSISTED,
+            manualDitherAllowed
+        )
+
+        val darkCalibrationAllowed = !framesOnly && !hdr
+        btnUseDarks.text = "Use darks"
+        setStackModeChoice(btnUseDarks, state.useDarks, darkCalibrationAllowed)
+
+        btnKeepSourceFrames.text =
+            "Keep Source Frames: ${if (state.keepSourceFrames) "ON" else "OFF"}"
+        setStackModeChoice(btnKeepSourceFrames, state.keepSourceFrames, !framesOnly)
+
+        btnOutputDng.text = "DNG: ${if (state.outputDng) "ON" else "OFF"}"
+        btnOutputXisf.text = "XISF: ${if (state.outputXisf) "ON" else "OFF"}"
+        btnOutputFits.text = "FITS: ${if (state.outputFits) "ON" else "OFF"}"
+        setStackModeChoice(btnOutputDng, state.outputDng, !framesOnly)
+        setStackModeChoice(btnOutputXisf, state.outputXisf, !framesOnly)
+        setStackModeChoice(btnOutputFits, state.outputFits, !framesOnly)
+
+        tvStackModesSummary.text = stackModesSummary(state)
+    }
+
+    /** Styles one exclusive/toggle control and dims unavailable combinations. */
+    private fun setStackModeChoice(button: Button, selected: Boolean, enabled: Boolean = true) {
+        button.isEnabled = enabled
+        button.alpha = if (enabled) 1f else 0.35f
+        applyButtonStroke(
+            button,
+            when {
+                !enabled -> 0xFF555555.toInt()
+                selected -> 0xFF00FF00.toInt()
+                else -> 0xFFFF0000.toInt()
+            }
+        )
+    }
+
+    /** Describes the exact result represented by the current Stack Modes draft. */
+    private fun stackModesSummary(state: StackModesUiState): String {
+        val processing =
+            when (state.processing) {
+                StackProcessingSelection.FRAMES_ONLY -> "Frames Only"
+                StackProcessingSelection.STACK -> "Stack"
+                StackProcessingSelection.HDR -> "HDR"
+                StackProcessingSelection.STAR_TRAIL -> "Star Trail"
+            }
+        val alignment =
+            when (state.alignment) {
+                StackAlignmentSelection.OFF -> "Off"
+                StackAlignmentSelection.LANDSCAPE -> "Landscape"
+                StackAlignmentSelection.STARS -> "Stars"
+            }
+        val outputs =
+            if (state.processing == StackProcessingSelection.FRAMES_ONLY) {
+                "Source DNG"
+            } else {
+                buildList {
+                    if (state.outputDng) {
+                        add(
+                            if (state.processing == StackProcessingSelection.HDR) {
+                                "DNG (Linear RGB Float16)"
+                            } else {
+                                "DNG (Bayer RAW16)"
+                            }
+                        )
+                    }
+                    if (state.outputXisf) add("XISF")
+                    if (state.outputFits) add("FITS")
+                }.joinToString()
+            }
+        return """
+PROCESSING  $processing
+ALIGNMENT   $alignment
+DITHERING   ${if (state.dithering == StackDitheringSelection.OFF) "Off" else "Manual Assisted"}
+CALIBRATION ${if (state.useDarks) "Use darks" else "Off"}
+SOURCE FRAMES  ${if (state.keepSourceFrames) "Save individual DNGs" else "Do not publish individual DNGs"}
+OUTPUTS        $outputs
+""".trimIndent()
+    }
+
+    /** Formats the committed selection for the main log. */
+    private fun stackModesLogLabel(state: StackModesUiState): String =
+        "${state.processing.name} / ${state.alignment.name} / ${state.dithering.name} / " +
+            "DARKS_${if (state.useDarks) "ON" else "OFF"}"
+
+    /** Updates the single top button with red default or green custom-state outline. */
     private fun updateStackModeButtons() {
         applyButtonStroke(
-            btnNormalStackMode,
-            if (stackModeController.normalEnabled) 0xFF00FF00.toInt() else 0xFFFF0000.toInt()
+            btnStackModes,
+            if (stackModesState != StackModesUiState()) {
+                0xFF00FF00.toInt()
+            } else {
+                0xFFFF0000.toInt()
+            }
         )
-        applyButtonStroke(
-            btnHdrStackMode,
-            if (stackModeController.hdrEnabled) 0xFF00FF00.toInt() else 0xFFFF0000.toInt()
-        )
+        updateDevButton()
     }
 
-    /** Gives the active stack mode a short log label. */
-    private fun stackModeLabel(): String =
-        when (stackModeController.mode) {
-            StackMode.NORMAL -> "Normal Stack"
-            StackMode.HDR -> "HDR Stack"
-            StackMode.OFF -> "OFF"
-        }
+    /** Shows whether the next capture is armed for the real aligned-stack diagnostic. */
+    private fun updateDevButton() {
+        if (!::btnDev.isInitialized || !isDebugBuild()) return
+        btnDev.text = if (devDiagnosticMode != null) "DEV*" else "DEV"
+        applyButtonStroke(
+            btnDev,
+            if (devDiagnosticMode != null) 0xFF00FF00.toInt() else 0xFFFF0000.toInt()
+        )
+    }
 
     /** Clears readiness flags for focus-bracket start/end values. */
     private fun clearFocusBracketLock() {
@@ -907,14 +1867,18 @@ Starts the capture sequence using the current settings.
 
     /** Releases camera, preview, thermal, and orientation resources on shutdown. */
     override fun onDestroy() {
+        running = false
+        releaseCapturePause()
         if (::orientationListener.isInitialized) orientationListener.disable()
         stopThermalUpdates()
+        diagnosticsExecutor.shutdownNow()
         super.onDestroy()
-        running = false
         liveFocusRunning = false
         stopFramingPreviewForCapture()
         runCatching { liveFocusSurface?.release() }
         liveFocusSurface = null
+        pendingDarkCaptureSession?.lightSequence?.cleanupTemporaryRawFrames()
+        pendingDarkCaptureSession = null
         closeEverything()
     }
 
@@ -3004,8 +3968,8 @@ Starts the capture sequence using the current settings.
             btnGetHigh,
             btnGetShadow,
             btnCompute,
-            btnNormalStackMode,
-            btnHdrStackMode,
+            btnStackModes,
+            btnDev,
             btnPreview,
             btnStart,
             btnAF,
@@ -3143,8 +4107,8 @@ Starts the capture sequence using the current settings.
         stopFramingPreviewForCapture()
         val camId = selectedCameraId()
         btnAF.isEnabled = false; btnAF.text = "focusing..."
-        btnNormalStackMode.isEnabled = false
-        btnHdrStackMode.isEnabled = false
+        btnStackModes.isEnabled = false
+        btnDev.isEnabled = false
         btnPreview.isEnabled = false
         etCameraId.isEnabled = false
         etIso.isEnabled = false
@@ -3172,8 +4136,8 @@ Starts the capture sequence using the current settings.
                 runOnUiThread {
                     btnAF.isEnabled = true
                     btnAF.text = if (locked) "AF LOCK" else "AF"
-                    btnNormalStackMode.isEnabled = true
-                    btnHdrStackMode.isEnabled = true
+                    btnStackModes.isEnabled = true
+                    btnDev.isEnabled = true
                     btnPreview.isEnabled = true
                     etCameraId.isEnabled = true
                     etIso.isEnabled = true
@@ -3296,8 +4260,7 @@ Starts the capture sequence using the current settings.
         stopFramingPreviewForCapture()
         val camId = selectedCameraId()
         btnAF.isEnabled = false; btnAF.text = "focusing..."
-        btnNormalStackMode.isEnabled = false
-        btnHdrStackMode.isEnabled = false
+        btnStackModes.isEnabled = false
         btnPreview.isEnabled = false
         etCameraId.isEnabled = false
         etIso.isEnabled = false
@@ -3324,8 +4287,7 @@ Starts the capture sequence using the current settings.
                 runOnUiThread {
                     btnAF.isEnabled = true
                     btnAF.text = "AF"
-                    btnNormalStackMode.isEnabled = true
-                    btnHdrStackMode.isEnabled = true
+                    btnStackModes.isEnabled = true
                     btnPreview.isEnabled = true
                     etCameraId.isEnabled = true
                     etIso.isEnabled = true
@@ -3482,32 +4444,121 @@ Starts the capture sequence using the current settings.
     //  CAPTURE
     // ══════════════════════════════════════════════
 
-    /** Parses non-empty exposure lines from the exposure input field. */
-    private fun parseExposures() = etExposures.text.toString().lines()
-        .map { it.trim() }.filter { it.isNotEmpty() }
-        .mapNotNull { line ->
-            parseExpString(line) ?: run { log("Invalid line: '$line'"); null }
+    /** Parses exposure and pause steps, expanding compact syntax when needed. */
+    private fun parseExposureSequence(): ExposureSequence? {
+        val original = etExposures.text.toString()
+        val expanded =
+            ExposureSequenceParser.expand(original, ::parseExpString)
+                ?: run {
+                    log("Invalid exposure or pause sequence")
+                    return null
+                }
+        val sequence =
+            ExposureSequenceParser.parse(expanded, ::parseExpString)
+                ?: run {
+                    log("Invalid exposure or pause position")
+                    return null
+                }
+        if (expanded != original.trim()) {
+            etExposures.setText(expanded)
+            etExposures.setSelection(etExposures.text.length)
+            saveSettings()
         }
+        tvBrackets.text =
+            buildString {
+                append("${sequence.exposureCount} frames")
+                if (sequence.pauseCount > 0) append(" / ${sequence.pauseCount} pause")
+            }
+        return sequence
+    }
+
+    /** Returns only exposure durations for controls that do not execute pauses. */
+    private fun parseExposures(): List<Long> =
+        parseExposureSequence()?.exposures.orEmpty()
 
     /** Validates UI inputs and starts the RAW bracketing capture sequence. */
     private fun startCapture() {
+        if (capturePauseWaiting) {
+            resumeCaptureSequence()
+            return
+        }
         if (running || liveFocusRunning) {
             log("Capture in progress")
             return
         }
 
+        val pendingDarkAtStart = pendingDarkCaptureSession
+        val capturingDarks = pendingDarkAtStart != null
+        if (capturingDarks && !pendingDarkCaptureMayStart()) return
+
         stopFramingPreviewForCapture()
-        clearLog()
-        var exposures = parseExposures()
-        if (exposures.isEmpty()) {
-            log("No valid exposure!"); return
+        if (!capturingDarks) clearLog()
+        var exposureSequence: ExposureSequence
+        var exposures: List<Long>
+        val focusValues: List<Float>?
+        val iso: Int
+        val camId: String
+        val intervalSec: Long
+        val focusDist: Float
+        val delaySec: Long
+
+        if (capturingDarks) {
+            val pending = requireNotNull(pendingDarkAtStart)
+            val records = pending.lightSequence.records.sortedBy { it.frameIndex }
+            if (records.isEmpty()) {
+                log("Dark calibration failed: retained lights are empty")
+                return
+            }
+            exposures = records.map { it.exposureTimeNs }
+            exposureSequence =
+                ExposureSequence(
+                    exposures.map {
+                        ExposureSequenceStep.Exposure(
+                            label = expNsToInputText(it),
+                            exposureTimeNs = it
+                        )
+                    }
+                )
+            focusValues = null
+            iso = records.first().iso
+            camId = pending.lightSequence.cameraId
+            intervalSec = 0L
+            focusDist = 0f
+            delaySec = 0L
+            log(
+                "Dark capture prepared from ${records.size} retained lights: " +
+                    "camera=$camId ISO=$iso exposure=${fmtExpNs(exposures.first())}"
+            )
+        } else {
+            exposureSequence = parseExposureSequence() ?: return
+            exposures = exposureSequence.exposures
+            if (exposures.isEmpty()) {
+                log("No valid exposure!"); return
+            }
+            focusValues =
+                if (focusStartReady || focusEndReady) {
+                    readFocusBracketValues(showErrors = true) ?: return
+                } else {
+                    null
+                }
+            iso = etIso.text.toString().toIntOrNull() ?: 400
+            camId = selectedCameraId()
+            intervalSec = etInterval.text.toString().toLongOrNull() ?: 0L
+            focusDist = etFocus.text.toString().replace(',', '.').toFloatOrNull() ?: 0f
+            delaySec = etDelay.text.toString().toLongOrNull() ?: 2L
         }
-        val focusValues =
-            if (focusStartReady || focusEndReady) readFocusBracketValues(showErrors = true) ?: return
-            else null
         if (focusValues != null) {
             if (exposures.size == 1 && focusValues.size > 1) {
                 exposures = List(focusValues.size) { exposures.first() }
+                exposureSequence =
+                    ExposureSequence(
+                        exposures.mapIndexed { index, exposure ->
+                            ExposureSequenceStep.Exposure(
+                                label = expNsToInputText(exposure),
+                                exposureTimeNs = exposures[index]
+                            )
+                        }
+                    )
             }
             if (exposures.size != focusValues.size) {
                 log("Focus frames must match exposures")
@@ -3520,19 +4571,83 @@ Starts the capture sequence using the current settings.
             log(focusValues.joinToString(" / ") { "%.4f".format(Locale.US, it) })
             log("Aguardando inicio da captura")
         }
-        val iso = etIso.text.toString().toIntOrNull() ?: 400
-        val camId = selectedCameraId()
-        val intervalSec = etInterval.text.toString().toLongOrNull() ?: 0L
-        val focusDist = etFocus.text.toString().replace(',', '.').toFloatOrNull() ?: 0f
-        val delaySec = etDelay.text.toString().toLongOrNull() ?: 2L
+        if (
+            !capturingDarks &&
+            stackModesState.dithering == StackDitheringSelection.MANUAL_ASSISTED &&
+            exposureSequence.pauseCount == 0
+        ) {
+            log("Manual dithering requires at least one pause in the exposure list")
+            return
+        }
+        if (
+            !capturingDarks &&
+            stackModesState.processing == StackProcessingSelection.HDR &&
+            (exposures.size < 2 || exposures.distinct().size < 2)
+        ) {
+            log("HDR requires at least 2 different exposure times")
+            return
+        }
+        if (
+            !capturingDarks &&
+            stackModesState.processing in
+                setOf(StackProcessingSelection.STACK, StackProcessingSelection.STAR_TRAIL) &&
+            exposures.distinct().size != 1
+        ) {
+            log("${stackModesState.processing.name} requires equal exposure times")
+            return
+        }
+        if (
+            !capturingDarks &&
+            stackModesState.processing != StackProcessingSelection.FRAMES_ONLY &&
+            focusValues != null
+        ) {
+            log("Stack Modes processing requires fixed focus; disable Focus Bracket")
+            return
+        }
+        if (
+            !capturingDarks &&
+            stackModesState.useDarks &&
+            !hasMasterDarkCaptureStorage(camId, exposures.size)
+        ) {
+            return
+        }
+        if (
+            capturingDarks &&
+            !hasMasterDarkCaptureStorage(camId, exposures.size)
+        ) {
+            return
+        }
+        if (
+            devDiagnosticMode == DevRawDiagnosticMode.HDRI32_MERGE &&
+            (exposures.size < 2 || exposures.distinct().size < 2)
+        ) {
+            log("DEV HDR requires at least 2 different exposure times")
+            return
+        }
+        if (
+            devDiagnosticMode == DevRawDiagnosticMode.CAPTURE_MASTER_DARK &&
+            !hasMasterDarkCaptureStorage(camId, exposures.size)
+        ) {
+            return
+        }
+        if (
+            devDiagnosticMode == DevRawDiagnosticMode.HDRI32_MERGE &&
+            !hasHdrI32CaptureStorage(camId, exposures.size)
+        ) {
+            return
+        }
 
         if (afLockedForCapture && afLockedCamId != camId) {
             closeEverything()
         }
 
         running = true
-        btnNormalStackMode.isEnabled = false
-        btnHdrStackMode.isEnabled = false
+        darkCaptureInProgress = capturingDarks
+        releaseCapturePause()
+        btnStart.text = "Capture"
+        applyButtonStroke(btnStart, 0xFFFFFFFF.toInt())
+        btnStackModes.isEnabled = false
+        btnDev.isEnabled = false
         btnPreview.isEnabled = false
         btnStart.isEnabled = false
         btnAF.isEnabled = false
@@ -3551,16 +4666,48 @@ Starts the capture sequence using the current settings.
         btnAeBiasPlus.isEnabled = false
         startBgThreads()
 
-        currentCaptureFolder =
-            if (folderModeEnabled) {
-                SimpleDateFormat("yyyyMMdd_HH_mm_ss", Locale.US).format(Date())
+        val lightStartTemperatureCelsius =
+            if (capturingDarks) {
+                requireNotNull(pendingDarkAtStart).initialCameraTemperatureCelsius
+            } else if (stackModesState.useDarks) {
+                latestCameraTemperatureCelsius
             } else {
                 null
             }
+        if (!capturingDarks) {
+            val captureTimestamp =
+                SimpleDateFormat("yyyyMMdd_HH_mm_ss", Locale.US).format(Date())
+            currentCaptureFolder =
+                if (
+                    folderModeEnabled ||
+                    stackModesState.processing != StackProcessingSelection.FRAMES_ONLY
+                ) {
+                    captureTimestamp
+                } else {
+                    null
+                }
+            currentStackOutputRelativePath =
+                stackModeDcimRelativePath(currentCaptureFolder ?: captureTimestamp)
+            if (stackModesState.useDarks) {
+                log(
+                    "Light start camera-usr stored: " +
+                        formatTemperatureForLog(lightStartTemperatureCelsius)
+                )
+            }
+        }
 
         if (currentCaptureFolder != null) {
             log("Folder: $currentCaptureFolder")
         }
+        val devAlignedStackAdapter =
+            if (capturingDarks) null else prepareDevAlignedStackAdapter(camId)
+        val productionStackAdapter =
+            when {
+                capturingDarks -> prepareProductionDarkAdapter(camId)
+                devAlignedStackAdapter == null -> prepareProductionStackAdapter(camId)
+                else -> null
+            }
+        val capturedSequenceAdapter = devAlignedStackAdapter ?: productionStackAdapter
         val normalStackProcessor = createNormalStackProcessor(exposures, focusValues, camId)
 
         saveQueue.clear()
@@ -3580,11 +4727,27 @@ Starts the capture sequence using the current settings.
                                 job.dngOrientation,
                                 job.dngOrientationDegrees,
                                 normalStackProcessor,
+                                capturedSequenceAdapter,
                                 job.slot
                             )
 
                         SaveJob.Stop -> {
                             normalStackProcessor?.finish()
+                            when {
+                                devAlignedStackAdapter != null ->
+                                    runDevAlignedStackDiagnostic(devAlignedStackAdapter)
+                                productionStackAdapter != null && capturingDarks ->
+                                    completeDarkCalibrationAndProcess(
+                                        productionStackAdapter.snapshot()
+                                    )
+                                productionStackAdapter != null && stackModesState.useDarks ->
+                                    armPendingDarkCapture(
+                                        productionStackAdapter.snapshot(),
+                                        lightStartTemperatureCelsius
+                                    )
+                                productionStackAdapter != null ->
+                                    runProductionStackMode(productionStackAdapter.snapshot())
+                            }
                             break@loop
                         }
                     }
@@ -3599,7 +4762,15 @@ Starts the capture sequence using the current settings.
 
         Thread({
             try {
-                runBracketing(exposures, focusValues, camId, iso, intervalSec, focusDist, delaySec)
+                runBracketing(
+                    exposureSequence.steps,
+                    focusValues,
+                    camId,
+                    iso,
+                    intervalSec,
+                    focusDist,
+                    delaySec
+                )
             } catch (e: InterruptedException) {
                 log("Interrupted.")
             } catch (e: Exception) {
@@ -3612,7 +4783,16 @@ Starts the capture sequence using the current settings.
                 }
                 try {
                     log("Saving...")
-                    val saveTimeoutMs = if (normalStackProcessor != null) 900_000L else 120_000L
+                    val saveTimeoutMs =
+                        if (
+                            normalStackProcessor != null ||
+                            devAlignedStackAdapter != null ||
+                            productionStackAdapter != null
+                        ) {
+                            900_000L
+                        } else {
+                            120_000L
+                        }
                     saveThread?.join(saveTimeoutMs)
                     if (saveThread?.isAlive == true) log("Still saving")
                 } catch (e: Exception) {
@@ -3625,27 +4805,110 @@ Starts the capture sequence using the current settings.
                 }
                 runOnUiThread {
                     running = false
-                    btnNormalStackMode.isEnabled = true
-                    btnHdrStackMode.isEnabled = true
-                    btnStart.isEnabled = true
-                    btnPreview.isEnabled = true
-                    btnAF.isEnabled = true
-                    etCameraId.isEnabled = true
-                    etIso.isEnabled = true
-                    btnWB.isEnabled = true
-                    btnFolderMode.isEnabled = true
-                    btnResetSettings.isEnabled = true
-                    btnHelp.isEnabled = true
-                    btnLiveFocus.isEnabled = true
-                    btnFocusBracket.isEnabled = true
-                    btnFocusStart.isEnabled = true
-                    btnFocusEnd.isEnabled = true
-                    btnAE.isEnabled = true
-                    btnAeBiasMinus.isEnabled = true
-                    btnAeBiasPlus.isEnabled = true
+                    releaseCapturePause()
+                    darkCaptureInProgress = false
+                    if (pendingDarkCaptureSession != null) {
+                        btnStackModes.isEnabled = false
+                        btnDev.isEnabled = false
+                        btnPreview.isEnabled = false
+                        btnAF.isEnabled = false
+                        etCameraId.isEnabled = false
+                        etIso.isEnabled = false
+                        btnWB.isEnabled = false
+                        btnFolderMode.isEnabled = false
+                        btnResetSettings.isEnabled = false
+                        btnHelp.isEnabled = false
+                        btnLiveFocus.isEnabled = false
+                        btnFocusBracket.isEnabled = false
+                        btnFocusStart.isEnabled = false
+                        btnFocusEnd.isEnabled = false
+                        btnAE.isEnabled = false
+                        btnAeBiasMinus.isEnabled = false
+                        btnAeBiasPlus.isEnabled = false
+                        refreshPendingDarkTemperature(latestCameraTemperatureCelsius)
+                    } else {
+                        btnStackModes.isEnabled = true
+                        btnDev.isEnabled = true
+                        btnStart.text = "Capture"
+                        applyButtonStroke(btnStart, 0xFFFFFFFF.toInt())
+                        btnStart.isEnabled = true
+                        btnPreview.isEnabled = true
+                        btnAF.isEnabled = true
+                        etCameraId.isEnabled = true
+                        etIso.isEnabled = true
+                        btnWB.isEnabled = true
+                        btnFolderMode.isEnabled = true
+                        btnResetSettings.isEnabled = true
+                        btnHelp.isEnabled = true
+                        btnLiveFocus.isEnabled = true
+                        btnFocusBracket.isEnabled = true
+                        btnFocusStart.isEnabled = true
+                        btnFocusEnd.isEnabled = true
+                        btnAE.isEnabled = true
+                        btnAeBiasMinus.isEnabled = true
+                        btnAeBiasPlus.isEnabled = true
+                    }
                 }
             }
         }, "bracketing-thread").start()
+    }
+
+    private fun hasMasterDarkCaptureStorage(cameraId: String, frameCount: Int): Boolean {
+        val rawSize =
+            runCatching {
+                cameraManager
+                    .getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?.getOutputSizes(ImageFormat.RAW_SENSOR)
+                    ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            }.getOrNull()
+        if (rawSize == null) {
+            log("MasterDark storage pre-flight unavailable")
+            return true
+        }
+        val estimate = DarkStorageEstimator.estimate(
+            width = rawSize.width,
+            height = rawSize.height,
+            darkFrameCount = frameCount,
+            outputDirectory = masterDarkRoot()
+        )
+        log(
+            "MasterDark storage: required=${estimate.totalRequiredBytes} " +
+                "available=${estimate.availableBytes}"
+        )
+        if (!estimate.sufficient) {
+            log("MasterDark capture cancelled: insufficient storage")
+        }
+        return estimate.sufficient
+    }
+
+    private fun hasHdrI32CaptureStorage(cameraId: String, frameCount: Int): Boolean {
+        val rawSize =
+            runCatching {
+                cameraManager
+                    .getCameraCharacteristics(cameraId)
+                    .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?.getOutputSizes(ImageFormat.RAW_SENSOR)
+                    ?.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            }.getOrNull()
+        if (rawSize == null) {
+            log("DEV HDR storage pre-flight unavailable")
+            return true
+        }
+        val estimate = HdrI32StorageEstimator.estimate(
+            width = rawSize.width,
+            height = rawSize.height,
+            frameCount = frameCount,
+            outputDirectory = hdri32Root()
+        )
+        log(
+            "DEV HDR storage: required=${estimate.totalRequiredBytes} " +
+                "available=${estimate.availableBytes}"
+        )
+        if (!estimate.sufficient) {
+            log("DEV HDR capture cancelled: insufficient storage")
+        }
+        return estimate.sufficient
     }
 
     private fun createNormalStackProcessor(
@@ -3653,14 +4916,34 @@ Starts the capture sequence using the current settings.
         focusValues: List<Float>?,
         camId: String
     ): NormalStackProcessor? {
-        return when (stackModeController.mode) {
-            StackMode.OFF -> null
-            StackMode.HDR -> {
-                log("HDR Stack not implemented yet")
+        if (stackModesState.processing != StackProcessingSelection.FRAMES_ONLY) {
+            return null
+        }
+        val plan = StackingPlanner.resolve(stackingConfig)
+        plan.warnings.forEach { log(it) }
+        plan.unsupportedReason?.let { log(it) }
+
+        return when (plan.intent) {
+            ProcessingIntent.SINGLE_CAPTURE -> null
+            ProcessingIntent.HDRI_MERGE -> {
+                log("HDR processing is controlled by Stack Modes")
                 null
             }
-            StackMode.NORMAL -> {
-                if (focusValues != null) {
+            ProcessingIntent.STAR_STACK -> {
+                log("Star Stack processing is controlled by Stack Modes")
+                null
+            }
+            ProcessingIntent.DARK_CAPTURE -> {
+                log("MasterDark capture is available through DEV diagnostics")
+                null
+            }
+            ProcessingIntent.NORMAL_STACK -> {
+                if (plan.alignmentMode != ResolvedAlignmentMode.NONE) {
+                    log(
+                        "Aligned Normal Stack is controlled by Stack Modes"
+                    )
+                    null
+                } else if (focusValues != null) {
                     log("Normal Stack skipped: focus bracket active")
                     null
                 } else if (exposures.distinct().size != 1) {
@@ -3684,11 +4967,56 @@ Starts the capture sequence using the current settings.
         }
     }
 
-    /** Captures the configured exposure/focus bracket as a RAW DNG sequence. */
+    /** Wakes a capture sequence that is waiting at a Pause step. */
+    private fun resumeCaptureSequence() {
+        synchronized(capturePauseLock) {
+            if (!capturePauseWaiting) return
+            capturePauseWaiting = false
+            capturePauseLock.notifyAll()
+        }
+        btnStart.text = "Capture"
+        btnStart.isEnabled = false
+        applyButtonStroke(btnStart, 0xFFFFFFFF.toInt())
+        log("Capture resumed")
+    }
+
+    /** Releases any waiting capture thread during completion, failure, or shutdown. */
+    private fun releaseCapturePause() {
+        synchronized(capturePauseLock) {
+            capturePauseWaiting = false
+            capturePauseLock.notifyAll()
+        }
+    }
+
+    /** Waits without closing the camera until the user presses the green Resume button. */
+    private fun waitForCaptureResume(completedFrames: Int, totalFrames: Int): Boolean {
+        synchronized(capturePauseLock) {
+            capturePauseWaiting = true
+        }
+        log("Pause: $completedFrames/$totalFrames frames captured - waiting Resume")
+        runOnUiThread {
+            btnStart.text = "Resume"
+            btnStart.isEnabled = true
+            applyButtonStroke(btnStart, 0xFF00FF00.toInt())
+        }
+        synchronized(capturePauseLock) {
+            while (capturePauseWaiting && running) {
+                capturePauseLock.wait()
+            }
+        }
+        return running
+    }
+
+    /** Captures the configured exposure/focus steps as a RAW DNG sequence. */
     private fun runBracketing(
-        exposures: List<Long>, focusValues: List<Float>?, camId: String, iso: Int,
+        steps: List<ExposureSequenceStep>, focusValues: List<Float>?, camId: String, iso: Int,
         intervalSec: Long, focusDist: Float, delaySec: Long
     ) {
+        val totalFrames = steps.count { it is ExposureSequenceStep.Exposure }
+        if (totalFrames <= 0) {
+            log("No exposure frames")
+            return
+        }
         if (!openSelectedCamera(camId)) return
         val rawSizes = chars!!.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             ?.getOutputSizes(ImageFormat.RAW_SENSOR)
@@ -3696,7 +5024,7 @@ Starts the capture sequence using the current settings.
             log("RAW_SENSOR not suported!"); return
         }
         val rawSize = rawSizes.maxByOrNull { it.width.toLong() * it.height }!!
-        val readerBuf = (exposures.size + 2).coerceIn(3, 8)
+        val readerBuf = (totalFrames + 2).coerceIn(3, 8)
         rawImageSlots = Semaphore((readerBuf - 1).coerceAtLeast(1))
         imageReader = ImageReader.newInstance(
             rawSize.width,
@@ -3731,7 +5059,7 @@ Starts the capture sequence using the current settings.
         )
         log("WB: ${whiteBalanceOptionForMode(validatedWbMode(chars))?.label ?: "AUTO"}")
 
-        log("${exposures.size} frames  f=$focusDist")
+        log("$totalFrames frames  f=$focusDist")
         focusValues?.let {
             log("Focus: ${it.joinToString(" / ") { value -> "%.4f".format(Locale.US, value) }}")
         }
@@ -3739,20 +5067,84 @@ Starts the capture sequence using the current settings.
             log("Delay ${delaySec}s..."); Thread.sleep(delaySec * 1000)
         }
 
-        var seq = 0
-        do {
-            seq++
-            log("Seq $seq")
-            for ((i, expNs) in exposures.withIndex()) {
-                if (!running) break
-                val frameFocus = focusValues?.getOrNull(i) ?: focusDist
-                captureOneRaw(expNs, iso, frameFocus, seq, i + 1, exposures.size)
+        val seq = 1
+        var exposureIndex = 0
+        var capturedFrameCount = 0
+        for ((stepIndex, step) in steps.withIndex()) {
+            if (!running) break
+            when (step) {
+                is ExposureSequenceStep.Exposure -> {
+                    val frameFocus = focusValues?.getOrNull(exposureIndex) ?: focusDist
+                    val frameNumber = exposureIndex + 1
+                    var captured = false
+                    for (attempt in 1..MAX_RAW_CAPTURE_ATTEMPTS) {
+                        captured = captureOneRaw(
+                            step.exposureTimeNs,
+                            iso,
+                            frameFocus,
+                            seq,
+                            frameNumber,
+                            totalFrames
+                        )
+                        if (captured || !running) break
+                        if (attempt < MAX_RAW_CAPTURE_ATTEMPTS) {
+                            log("Retrying shot $frameNumber/$totalFrames")
+                            Thread.sleep(LONG_EXPOSURE_SETTLE_MS)
+                        }
+                    }
+                    if (!captured && running) {
+                        log(
+                            "Shot $frameNumber/$totalFrames skipped after " +
+                                "$MAX_RAW_CAPTURE_ATTEMPTS attempts"
+                        )
+                    } else if (captured) {
+                        capturedFrameCount++
+                    }
+                    if (
+                        captured &&
+                        step.exposureTimeNs >= LONG_EXPOSURE_SETTLE_THRESHOLD_NS &&
+                        frameNumber < totalFrames
+                    ) {
+                        // Some Camera2 HALs need a brief idle interval after a long RAW exposure.
+                        val advertisedMaximumExposure =
+                            chars
+                                ?.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                                ?.upper
+                        val settleMs =
+                            if (
+                                advertisedMaximumExposure != null &&
+                                step.exposureTimeNs > advertisedMaximumExposure
+                            ) {
+                                EXTENDED_EXPOSURE_SETTLE_MS
+                            } else {
+                                LONG_EXPOSURE_SETTLE_MS
+                            }
+                        log("RAW pipeline settle ${settleMs}ms")
+                        Thread.sleep(settleMs)
+                    }
+                    exposureIndex++
+
+                    val nextStep = steps.getOrNull(stepIndex + 1)
+                    if (
+                        running &&
+                        intervalSec > 0L &&
+                        nextStep is ExposureSequenceStep.Exposure
+                    ) {
+                        log("Frame gap ${intervalSec}s")
+                        var remainingSeconds = intervalSec
+                        while (running && remainingSeconds > 0L) {
+                            Thread.sleep(1000L)
+                            remainingSeconds--
+                        }
+                    }
+                }
+
+                ExposureSequenceStep.Pause -> {
+                    if (!waitForCaptureResume(exposureIndex, totalFrames)) break
+                }
             }
-            if (!running || intervalSec <= 0L) break
-            log(" ${intervalSec}s...")
-            repeat(intervalSec.toInt()) { if (running) Thread.sleep(1000) }
-        } while (running)
-        log("Captured $seq seq")
+        }
+        log("Captured $capturedFrameCount/$totalFrames frames")
     }
 
     /** Keeps a repeating preview request alive so the AF lock is retained. */
@@ -3783,10 +5175,11 @@ Starts the capture sequence using the current settings.
         seq: Int,
         idx: Int,
         total: Int
-    ) {
+    ): Boolean {
         val imageSlot = rawImageSlots
         imageSlot.acquire()
         var handedToSaver = false
+        val captureFinished = AtomicBoolean(false)
 
         try {
             log("Shot $idx/$total ${fmtExpNs(expNs)}")
@@ -3795,12 +5188,18 @@ Starts the capture sequence using the current settings.
             val resultLatch = CountDownLatch(1)
             val imageLatch = CountDownLatch(1)
             val resultRef = AtomicReference<TotalCaptureResult?>(null)
+            val failureRef = AtomicReference<CaptureFailure?>(null)
             val imageRef = AtomicReference<Image?>(null)
 
             imageReader.setOnImageAvailableListener(
                 { r ->
                     try {
-                        imageRef.getAndSet(r.acquireLatestImage())?.close()
+                        val image = r.acquireLatestImage()
+                        if (captureFinished.get()) {
+                            image?.close()
+                        } else {
+                            imageRef.getAndSet(image)?.close()
+                        }
                     } catch (e: Exception) {
                         Log.e(TAG, "rawImage", e)
                         log("Image error: ${e.message}")
@@ -3855,20 +5254,40 @@ Starts the capture sequence using the current settings.
                     r: CaptureRequest,
                     f: CaptureFailure
                 ) {
-                    log("Shot failed ${f.reason}")
+                    failureRef.set(f)
                     resultLatch.countDown()
-                    imageLatch.countDown()
                 }
             }, bgHandler)
 
             val gotRes = resultLatch.await((expNs / 1_000_000_000L) + 20L, TimeUnit.SECONDS)
-            val gotImg = imageLatch.await(10, TimeUnit.SECONDS)
+            val failure = failureRef.get()
+            val gotImg =
+                if (failure == null) {
+                    imageLatch.await(10, TimeUnit.SECONDS)
+                } else {
+                    imageLatch.count == 0L
+                }
             val result = resultRef.get()
             val image = imageRef.get()
 
             when {
                 !gotRes -> {
                     log("Result timeout $idx/$total")
+                    image?.close()
+                }
+
+                failure != null -> {
+                    val reason =
+                        when (failure.reason) {
+                            CaptureFailure.REASON_ERROR -> "ERROR"
+                            CaptureFailure.REASON_FLUSHED -> "FLUSHED"
+                            else -> failure.reason.toString()
+                        }
+                    log(
+                        "Shot failed $idx/$total reason=$reason " +
+                            "frame=${failure.frameNumber} sequence=${failure.sequenceId} " +
+                            "imageCaptured=${failure.wasImageCaptured()}"
+                    )
                     image?.close()
                 }
 
@@ -3902,9 +5321,11 @@ Starts the capture sequence using the current settings.
                 }
             }
         } finally {
+            captureFinished.set(true)
             runCatching { imageReader.setOnImageAvailableListener(null, null) }
             if (!handedToSaver) imageSlot.release()
         }
+        return handedToSaver
     }
 
     // ══════════════════════════════════════════════
@@ -3923,20 +5344,58 @@ Starts the capture sequence using the current settings.
         dngOrientation: Int,
         dngOrientationDegrees: Int,
         normalStackProcessor: NormalStackProcessor?,
+        capturedSequenceAdapter: CapturedRawSequenceAdapter?,
         slot: Semaphore
     ) {
         try {
             val c = chars ?: run { log("Camera data missing"); return }
+            capturedSequenceAdapter?.let { adapter ->
+                runCatching {
+                    adapter.accept(
+                        image = image,
+                        result = result,
+                        sequenceNumber = seq,
+                        captureFrameNumber = frame,
+                        requestedExposureTimeNs = expNs,
+                        requestedIso = iso,
+                        dngOrientation = dngOrientation,
+                        dngOrientationDegrees = dngOrientationDegrees
+                    )
+                }.onSuccess { accept ->
+                    log(accept.message)
+                }.onFailure {
+                    log("RAW frame copy error: ${it.message}")
+                }
+            }
+            if (
+                capturedSequenceAdapter?.diagnosticMode == DevRawDiagnosticMode.STAR_DETECTION ||
+                capturedSequenceAdapter?.diagnosticMode == DevRawDiagnosticMode.STAR_MATCHING ||
+                capturedSequenceAdapter?.diagnosticMode == DevRawDiagnosticMode.STAR_ALIGNED_STACK
+            ) {
+                log("DEV star frame retained for backend diagnostic")
+                return
+            }
+            val productionCapture =
+                capturedSequenceAdapter != null &&
+                    capturedSequenceAdapter.diagnosticMode == null
+            if (capturedSequenceAdapter?.isDarkCalibrationSequence == true) {
+                log("Dark RAW retained for same-session MasterDark")
+                return
+            }
+            if (productionCapture && !stackModesState.keepSourceFrames) {
+                log("Source DNG skipped; RAW retained only for selected processing")
+                return
+            }
             val dng = DngCreator(c, result)
             dng.setOrientation(dngOrientation)
             val name = buildDngName(seq, frame, expNs, iso)
             val dngBytes = createDngBytes(dng, image, wbGains)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val folderPath =
-                    if (currentCaptureFolder != null) {
-                        "DCIM/BracketLab/$currentCaptureFolder"
+                    if (productionCapture) {
+                        "${requireNotNull(currentStackOutputRelativePath)}/Frames"
                     } else {
-                        "DCIM/BracketLab"
+                        currentStackOutputRelativePath ?: "DCIM/BracketLab/Frames"
                     }
 
                 val cv = ContentValues().apply {
@@ -3954,11 +5413,11 @@ Starts the capture sequence using the current settings.
             } else {
                 @Suppress("DEPRECATION")
                 val subFolder =
-                    if (currentCaptureFolder != null) {
-                        "BracketLab/$currentCaptureFolder"
+                    (if (productionCapture) {
+                        "${requireNotNull(currentStackOutputRelativePath)}/Frames"
                     } else {
-                        "BracketLab"
-                    }
+                        currentStackOutputRelativePath ?: "DCIM/BracketLab/Frames"
+                    }).removePrefix("DCIM/")
 
                 val dir = File(
                     Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
@@ -4295,6 +5754,7 @@ Starts the capture sequence using the current settings.
     /** Detects messages that should be rendered as errors. */
     private fun isErrorLog(text: String): Boolean =
         text.contains("error") ||
+            text.contains("self-test: fail") ||
             text.contains("failed") ||
             text.startsWith("fail ") ||
             text.contains(" denied") ||

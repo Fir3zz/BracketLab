@@ -34,26 +34,9 @@
                 android:textStyle="bold" />
 
             <Button
-                android:id="@+id/btnNormalStackMode"
+                android:id="@+id/btnStackModes"
                 style="@style/DbeColumnButton"
-                android:layout_width="42dp"
-                android:layout_height="20dp"
-                android:layout_marginEnd="4dp"
-                android:background="@drawable/dbe_button"
-                android:backgroundTint="@null"
-                android:fontFamily="@font/cousine"
-                android:gravity="center"
-                android:includeFontPadding="false"
-                android:padding="0dp"
-                android:text="Normal"
-                android:textAllCaps="false"
-                android:textColor="#FFFFFF"
-                android:textSize="6sp" />
-
-            <Button
-                android:id="@+id/btnHdrStackMode"
-                style="@style/DbeColumnButton"
-                android:layout_width="32dp"
+                android:layout_width="78dp"
                 android:layout_height="20dp"
                 android:layout_marginEnd="6dp"
                 android:background="@drawable/dbe_button"
@@ -62,10 +45,28 @@
                 android:gravity="center"
                 android:includeFontPadding="false"
                 android:padding="0dp"
-                android:text="HDR"
+                android:text="Stack Modes"
                 android:textAllCaps="false"
                 android:textColor="#FFFFFF"
                 android:textSize="7sp" />
+
+            <Button
+                android:id="@+id/btnDev"
+                style="@style/DbeColumnButton"
+                android:layout_width="34dp"
+                android:layout_height="20dp"
+                android:layout_marginEnd="6dp"
+                android:background="@drawable/dbe_button"
+                android:backgroundTint="@null"
+                android:fontFamily="@font/cousine"
+                android:gravity="center"
+                android:includeFontPadding="false"
+                android:padding="0dp"
+                android:text="DEV"
+                android:textAllCaps="false"
+                android:textColor="#FFFFFF"
+                android:textSize="7sp"
+                android:visibility="gone" />
 
             <Space
                 android:layout_width="0dp"
@@ -149,7 +150,7 @@
                                 android:focusable="false"
                                 android:gravity="center"
                                 android:importantForAccessibility="no"
-                                android:text="1/30+3, 1/50+2&#10;1/30&#10;1/30&#10;1/30&#10;1/50&#10;1/50"
+                                android:text="15+8, pause(4)&#10;15&#10;15&#10;15&#10;15&#10;Pause&#10;15..."
                                 android:textColor="#505050"
                                 android:textSize="11sp" />
 
@@ -820,7 +821,7 @@
                         android:layout_width="match_parent"
                         android:layout_height="16dp"
                         android:fontFamily="@font/cousine"
-                        android:text="Interval:"
+                        android:text="Frame gap:"
                         android:textColor="#ccc"
                         android:textSize="10sp" />
 
@@ -997,6 +998,350 @@
             android:progress="0"
             android:visibility="gone" />
 
+    </FrameLayout>
+
+    <FrameLayout
+        android:id="@+id/stackModesOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#F5000000"
+        android:clickable="true"
+        android:focusable="true"
+        android:padding="10dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="34dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:fontFamily="@font/cousine"
+                    android:gravity="center_vertical"
+                    android:text="Stack Modes"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/btnStackModesClose"
+                    style="@style/DbeColumnButton"
+                    android:layout_width="72dp"
+                    android:layout_height="28dp"
+                    android:background="@drawable/dbe_button"
+                    android:backgroundTint="@null"
+                    android:fontFamily="@font/cousine"
+                    android:padding="0dp"
+                    android:text="Close"
+                    android:textAllCaps="false"
+                    android:textColor="#FFFFFF"
+                    android:textSize="10sp" />
+            </LinearLayout>
+
+            <ScrollView
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_marginTop="8dp"
+                android:layout_weight="1"
+                android:fillViewport="true"
+                android:scrollbarStyle="insideInset">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:paddingBottom="12dp">
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Processing"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:orientation="horizontal">
+
+                        <Button
+                            android:id="@+id/btnModeFramesOnly"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="Frames Only"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnModeStack"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="Stack"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnModeHdri"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="HDR"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnModeStarTrail"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_weight="1"
+                            android:text="Star Trail"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:layout_marginTop="12dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Calibration"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnUseDarks"
+                        style="@style/DbeColumnButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:text="Use darks"
+                        android:textSize="9sp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:layout_marginTop="12dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Alignment"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:orientation="horizontal">
+
+                        <Button
+                            android:id="@+id/btnAlignmentOff"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="Off"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnAlignmentLandscape"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="Landscape"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnAlignmentStars"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_weight="1"
+                            android:text="Stars"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:layout_marginTop="12dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Dithering"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:orientation="horizontal">
+
+                        <Button
+                            android:id="@+id/btnDitherOff"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="Off"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnDitherManual"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_weight="1"
+                            android:text="Manual Assisted"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:layout_marginTop="12dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Source Frames"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <Button
+                        android:id="@+id/btnKeepSourceFrames"
+                        style="@style/DbeColumnButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:text="Keep Source Frames"
+                        android:textSize="9sp" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="22dp"
+                        android:layout_marginTop="12dp"
+                        android:background="@drawable/dbe_section_header"
+                        android:fontFamily="@font/cousine"
+                        android:gravity="center_vertical"
+                        android:paddingStart="6dp"
+                        android:text="Outputs"
+                        android:textColor="#FFFFFF"
+                        android:textSize="11sp"
+                        android:textStyle="bold" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="40dp"
+                        android:layout_marginTop="6dp"
+                        android:orientation="horizontal">
+
+                        <Button
+                            android:id="@+id/btnOutputDng"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="DNG"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnOutputXisf"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_marginEnd="4dp"
+                            android:layout_weight="1"
+                            android:text="XISF"
+                            android:textSize="9sp" />
+
+                        <Button
+                            android:id="@+id/btnOutputFits"
+                            style="@style/DbeColumnButton"
+                            android:layout_width="0dp"
+                            android:layout_height="match_parent"
+                            android:layout_weight="1"
+                            android:text="FITS"
+                            android:textSize="9sp" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/tvStackModesSummary"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@drawable/dbe_field_dark"
+                        android:fontFamily="@font/cousine"
+                        android:lineSpacingExtra="1dp"
+                        android:minHeight="64dp"
+                        android:padding="6dp"
+                        android:textColor="#FFFFFF"
+                        android:textSize="9sp" />
+                </LinearLayout>
+            </ScrollView>
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="42dp"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/btnStackModesDefaults"
+                    style="@style/DbeColumnButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_marginEnd="6dp"
+                    android:layout_weight="1"
+                    android:text="Defaults"
+                    android:textSize="10sp" />
+
+                <Button
+                    android:id="@+id/btnStackModesApply"
+                    style="@style/DbeColumnButton"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="2"
+                    android:text="Apply"
+                    android:textSize="10sp"
+                    android:textStyle="bold" />
+            </LinearLayout>
+        </LinearLayout>
     </FrameLayout>
 
     <FrameLayout

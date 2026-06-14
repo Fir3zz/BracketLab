@@ -1,11 +1,13 @@
 # Gradle and Android build output
 .gradle/
 .gradle-user/
+.gradle-codex/
 build/
 app/build/
 
 # Local Android SDKs and downloaded toolchains
 Sdk/
+.android-sdk-codex/
 gradle-8.12/
 gradle-*.zip
 
